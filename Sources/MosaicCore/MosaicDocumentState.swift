@@ -13,6 +13,7 @@ public final class MosaicDocumentState {
     public var originalImage: CGImage?
     public var previewOriginalImage: CGImage?
     public var previewMosaicImage: CGImage?
+    public var previewEffectImages: [MosaicEffectSpec: CGImage] = [:]
     public var previewScale: CGFloat = 1.0
     public var sourceURL: URL?
     public var fileName: String = "猫猫藏藏"
@@ -20,6 +21,10 @@ public final class MosaicDocumentState {
     public var isEditingBrushSize: Bool = false
     public var isPointerOverFloatingControls: Bool = false
     public var isFilmstripExpandedWhileZoomed: Bool = false
+
+    public var currentEffectSpec: MosaicEffectSpec {
+        MosaicEffectSpec(style: effectStyle, granularity: granularity)
+    }
 
     public var isEditingTextInput: Bool {
         isRenamingTitle || isEditingBrushSize
@@ -55,9 +60,7 @@ public final class MosaicDocumentState {
         let original: CGImage
         let previewOriginal: CGImage
         let previewScale: CGFloat
-        let previewMosaic: CGImage?
-        let granularity: MosaicGranularity
-        let effectStyle: MosaicEffectStyle
+        var previewEffects: [MosaicEffectSpec: CGImage]
         let rotationQuarterTurns: Int
     }
 
@@ -262,10 +265,10 @@ public final class MosaicDocumentState {
         )
         queue = [item]
         currentIndex = 0
+        let spec = MosaicEffectSpec(style: item.effectStyle, granularity: item.granularity)
         let entry = Self.makePreparedEntry(
             from: cgImage,
-            granularity: item.granularity,
-            effectStyle: item.effectStyle,
+            specs: [spec],
             rotationQuarterTurns: item.rotationQuarterTurns
         )
         cachePreparedEntry(entry, for: item.id)
@@ -365,34 +368,41 @@ public final class MosaicDocumentState {
         return nil
     }
 
+    private static func requiredSpecs(for item: MosaicQueueItem) -> Set<MosaicEffectSpec> {
+        var specs: Set<MosaicEffectSpec> = [
+            MosaicEffectSpec(style: item.effectStyle, granularity: item.granularity)
+        ]
+        for stroke in item.strokes where stroke.tool != .eraser {
+            specs.insert(
+                stroke.resolvedEffectSpec(
+                    fallbackStyle: item.effectStyle,
+                    fallbackGranularity: item.granularity
+                )
+            )
+        }
+        return specs
+    }
+
     private func activateItem(at index: Int) {
         guard queue.indices.contains(index) else { return }
         let item = queue[index]
+        let neededSpecs = Self.requiredSpecs(for: item)
         do {
             let entry: PreparedImageEntry
-            if let cached = preparedImageCache[item.id], cached.rotationQuarterTurns == item.rotationQuarterTurns {
-                if cached.granularity == item.granularity && cached.effectStyle == item.effectStyle {
-                    entry = cached
-                } else {
-                    let mosaic = Self.makePreviewEffect(
+            if var cached = preparedImageCache[item.id], cached.rotationQuarterTurns == item.rotationQuarterTurns {
+                for spec in neededSpecs where cached.previewEffects[spec] == nil {
+                    if let rendered = Self.makePreviewEffect(
                         original: cached.original,
                         previewOriginal: cached.previewOriginal,
                         previewScale: cached.previewScale,
-                        granularity: item.granularity,
-                        style: item.effectStyle
-                    )
-                    let updated = PreparedImageEntry(
-                        original: cached.original,
-                        previewOriginal: cached.previewOriginal,
-                        previewScale: cached.previewScale,
-                        previewMosaic: mosaic,
-                        granularity: item.granularity,
-                        effectStyle: item.effectStyle,
-                        rotationQuarterTurns: item.rotationQuarterTurns
-                    )
-                    cachePreparedEntry(updated, for: item.id)
-                    entry = updated
+                        granularity: spec.granularity,
+                        style: spec.style
+                    ) {
+                        cached.previewEffects[spec] = rendered
+                    }
                 }
+                cachePreparedEntry(cached, for: item.id)
+                entry = cached
             } else {
                 let rawImage: CGImage
                 if let inMemory = item.inMemoryImage {
@@ -405,8 +415,7 @@ public final class MosaicDocumentState {
                 let cgImage = MosaicRenderer.rotateImage(rawImage, quarterTurns: item.rotationQuarterTurns)
                 let built = Self.makePreparedEntry(
                     from: cgImage,
-                    granularity: item.granularity,
-                    effectStyle: item.effectStyle,
+                    specs: neededSpecs,
                     rotationQuarterTurns: item.rotationQuarterTurns
                 )
                 cachePreparedEntry(built, for: item.id)
@@ -420,25 +429,27 @@ public final class MosaicDocumentState {
 
     nonisolated private static func makePreparedEntry(
         from cgImage: CGImage,
-        granularity: MosaicGranularity,
-        effectStyle: MosaicEffectStyle,
+        specs: Set<MosaicEffectSpec>,
         rotationQuarterTurns: Int
     ) -> PreparedImageEntry {
         let preview = MosaicRenderer.makePreviewImage(from: cgImage)
-        let mosaic = makePreviewEffect(
-            original: cgImage,
-            previewOriginal: preview.image,
-            previewScale: preview.scale,
-            granularity: granularity,
-            style: effectStyle
-        )
+        var effects: [MosaicEffectSpec: CGImage] = [:]
+        for spec in specs {
+            if let effect = makePreviewEffect(
+                original: cgImage,
+                previewOriginal: preview.image,
+                previewScale: preview.scale,
+                granularity: spec.granularity,
+                style: spec.style
+            ) {
+                effects[spec] = effect
+            }
+        }
         return PreparedImageEntry(
             original: cgImage,
             previewOriginal: preview.image,
             previewScale: preview.scale,
-            previewMosaic: mosaic,
-            granularity: granularity,
-            effectStyle: effectStyle,
+            previewEffects: effects,
             rotationQuarterTurns: rotationQuarterTurns
         )
     }
@@ -481,12 +492,12 @@ public final class MosaicDocumentState {
             .map { queue[$0] }
             .filter { preparedImageCache[$0.id] == nil }
             .prefix(max(0, maxCachedPreparedImages - 1))
-            .map { ($0.id, $0.sourceURL, $0.inMemoryImage, $0.granularity, $0.effectStyle, $0.rotationQuarterTurns) }
+            .map { ($0.id, $0.sourceURL, $0.inMemoryImage, Self.requiredSpecs(for: $0), $0.rotationQuarterTurns) }
 
         guard !candidates.isEmpty else { return }
 
         preloadTask = Task { @MainActor [weak self] in
-            for (itemID, url, memImage, granularity, style, turns) in candidates {
+            for (itemID, url, memImage, specs, turns) in candidates {
                 if Task.isCancelled { return }
                 let entry: PreparedImageEntry? = await Task.detached(priority: .utility) {
                     let rawImage: CGImage?
@@ -501,8 +512,7 @@ public final class MosaicDocumentState {
                     let oriented = MosaicRenderer.rotateImage(rawImage, quarterTurns: turns)
                     return Self.makePreparedEntry(
                         from: oriented,
-                        granularity: granularity,
-                        effectStyle: style,
+                        specs: specs,
                         rotationQuarterTurns: turns
                     )
                 }.value
@@ -543,7 +553,7 @@ public final class MosaicDocumentState {
     private func applyPreparedEntry(_ entry: PreparedImageEntry, item: MosaicQueueItem) {
         self.originalImage = entry.original
         self.previewOriginalImage = entry.previewOriginal
-        self.previewMosaicImage = entry.previewMosaic
+        self.previewEffectImages = entry.previewEffects
         self.previewScale = entry.previewScale
         self.sourceURL = item.sourceURL
         self.fileName = item.fileName
@@ -553,6 +563,7 @@ public final class MosaicDocumentState {
         self.isFilmstripExpandedWhileZoomed = false
         self.granularity = item.granularity
         self.effectStyle = item.effectStyle
+        self.previewMosaicImage = entry.previewEffects[MosaicEffectSpec(style: item.effectStyle, granularity: item.granularity)]
         self.cropRect = item.cropRect
         self.rotationQuarterTurns = item.rotationQuarterTurns
         self.draftCropRect = item.cropRect
@@ -659,6 +670,7 @@ public final class MosaicDocumentState {
         originalImage = nil
         previewOriginalImage = nil
         previewMosaicImage = nil
+        previewEffectImages.removeAll()
         previewScale = 1.0
         sourceURL = nil
         fileName = "猫猫藏藏"
@@ -685,40 +697,45 @@ public final class MosaicDocumentState {
     public func setGranularity(_ newGranularity: MosaicGranularity) {
         guard granularity != newGranularity else { return }
         granularity = newGranularity
-        syncCurrentQueueItem()
-        rebuildPreviewEffectLayer()
+        syncCurrentQueueItem(resetExportedIfChanged: false)
+        previewMosaicImage = previewEffectImage(for: currentEffectSpec)
     }
 
     public func setEffectStyle(_ newStyle: MosaicEffectStyle) {
         guard effectStyle != newStyle else { return }
         effectStyle = newStyle
-        syncCurrentQueueItem()
-        rebuildPreviewEffectLayer()
+        syncCurrentQueueItem(resetExportedIfChanged: false)
+        previewMosaicImage = previewEffectImage(for: currentEffectSpec)
     }
 
-    private func rebuildPreviewEffectLayer() {
-        guard let originalImage, let previewOriginalImage else { return }
-        let newEffect = Self.makePreviewEffect(
+    @discardableResult
+    public func previewEffectImage(for spec: MosaicEffectSpec) -> CGImage? {
+        if let existing = previewEffectImages[spec] {
+            return existing
+        }
+        guard let originalImage, let previewOriginalImage else { return nil }
+        guard let generated = Self.makePreviewEffect(
             original: originalImage,
             previewOriginal: previewOriginalImage,
             previewScale: previewScale,
-            granularity: granularity,
-            style: effectStyle
-        )
-        previewMosaicImage = newEffect
+            granularity: spec.granularity,
+            style: spec.style
+        ) else {
+            return nil
+        }
+        previewEffectImages[spec] = generated
         if queue.indices.contains(currentIndex) {
             let itemID = queue[currentIndex].id
             let updated = PreparedImageEntry(
                 original: originalImage,
                 previewOriginal: previewOriginalImage,
                 previewScale: previewScale,
-                previewMosaic: newEffect,
-                granularity: granularity,
-                effectStyle: effectStyle,
+                previewEffects: previewEffectImages,
                 rotationQuarterTurns: rotationQuarterTurns
             )
             cachePreparedEntry(updated, for: itemID)
         }
+        return generated
     }
 
     public func beginCrop() {
@@ -774,7 +791,9 @@ public final class MosaicDocumentState {
                 tool: stroke.tool,
                 diameter: stroke.diameter,
                 points: rotatedPoints,
-                rect: rotatedRect
+                rect: rotatedRect,
+                effectStyle: stroke.effectStyle,
+                granularity: stroke.granularity
             )
         }
 
@@ -784,16 +803,20 @@ public final class MosaicDocumentState {
         rotationQuarterTurns = (rotationQuarterTurns + 1) % 4
 
         let rotatedOriginal = MosaicRenderer.rotateImage(originalImage, quarterTurns: 1)
+        var specs: Set<MosaicEffectSpec> = [currentEffectSpec]
+        for stroke in strokes where stroke.tool != .eraser {
+            specs.insert(stroke.resolvedEffectSpec(fallbackStyle: effectStyle, fallbackGranularity: granularity))
+        }
         let entry = Self.makePreparedEntry(
             from: rotatedOriginal,
-            granularity: granularity,
-            effectStyle: effectStyle,
+            specs: specs,
             rotationQuarterTurns: rotationQuarterTurns
         )
 
         self.originalImage = entry.original
         self.previewOriginalImage = entry.previewOriginal
-        self.previewMosaicImage = entry.previewMosaic
+        self.previewEffectImages = entry.previewEffects
+        self.previewMosaicImage = entry.previewEffects[currentEffectSpec]
         self.previewScale = entry.previewScale
         self.maskRevision += 1
         self.zoomMode = .fit

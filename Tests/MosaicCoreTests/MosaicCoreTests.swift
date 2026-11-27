@@ -866,4 +866,137 @@ final class MosaicCoreTests: XCTestCase {
         XCTAssertEqual(state.currentIndex, 1)
         XCTAssertFalse(state.hasUnsavedChanges)
     }
+
+    func testMixedEffectStylesAndGranularitiesAreIndependentOnSameImage() throws {
+        let original = try makeAlternatingTestImage(width: 240, height: 120)
+
+        let blurStroke = MosaicStroke(
+            tool: .rectangle,
+            rect: CGRect(x: 10, y: 20, width: 40, height: 80),
+            effectStyle: .blur,
+            granularity: .medium
+        )
+        let mosaicStroke = MosaicStroke(
+            tool: .rectangle,
+            rect: CGRect(x: 70, y: 20, width: 40, height: 80),
+            effectStyle: .mosaic,
+            granularity: .coarse
+        )
+        let solidBlackStroke = MosaicStroke(
+            tool: .rectangle,
+            rect: CGRect(x: 130, y: 20, width: 40, height: 80),
+            effectStyle: .solid,
+            granularity: .fine
+        )
+        let solidWhiteStroke = MosaicStroke(
+            tool: .rectangle,
+            rect: CGRect(x: 190, y: 20, width: 40, height: 80),
+            effectStyle: .solid,
+            granularity: .coarse
+        )
+        let eraserInBlur = MosaicStroke(
+            tool: .eraser,
+            diameter: 14,
+            points: [CGPoint(x: 30, y: 40)]
+        )
+
+        let rendered = try XCTUnwrap(
+            MosaicRenderer.renderFinalImage(
+                original: original,
+                strokes: [blurStroke, mosaicStroke, solidBlackStroke, solidWhiteStroke, eraserInBlur],
+                granularity: .fine,
+                style: .mosaic
+            )
+        )
+
+        // Region A remaining blurred area (x=30, y=80) stays blurred (averaged red/blue ~127, green=0)
+        let blurPx = try pixelRGBA(of: rendered, x: 30, yFromBottom: 80)
+        XCTAssertGreaterThan(blurPx.0, 50)
+        XCTAssertGreaterThan(blurPx.2, 50)
+        XCTAssertLessThan(blurPx.0, 210)
+        XCTAssertLessThan(blurPx.2, 210)
+
+        // Erased point inside blur (x=30, y=40) restores exact original pixel
+        let origAtErased = try pixelRGBA(of: original, x: 30, yFromBottom: 40)
+        let renderedAtErased = try pixelRGBA(of: rendered, x: 30, yFromBottom: 40)
+        XCTAssertEqual(renderedAtErased.0, origAtErased.0)
+        XCTAssertEqual(renderedAtErased.2, origAtErased.2)
+
+        // Region B remains mosaic (coarse blended red/blue, definitely not solid white/black)
+        let mosaicPx = try pixelRGBA(of: rendered, x: 90, yFromBottom: 60)
+        XCTAssertEqual(mosaicPx.1, 0)
+        XCTAssertGreaterThan(mosaicPx.0, 40)
+        XCTAssertGreaterThan(mosaicPx.2, 40)
+
+        // Region C remains solid black (~20, 20, 20)
+        let blackPx = try pixelRGBA(of: rendered, x: 150, yFromBottom: 60)
+        XCTAssertLessThan(blackPx.0, 35)
+        XCTAssertLessThan(blackPx.1, 35)
+        XCTAssertLessThan(blackPx.2, 35)
+
+        // Region D remains solid white (~240, 240, 240)
+        let whitePx = try pixelRGBA(of: rendered, x: 210, yFromBottom: 60)
+        XCTAssertGreaterThan(whitePx.0, 220)
+        XCTAssertGreaterThan(whitePx.1, 220)
+        XCTAssertGreaterThan(whitePx.2, 220)
+
+        // Untouched corner stays original
+        let origCorner = try pixelRGBA(of: original, x: 2, yFromBottom: 2)
+        let renderedCorner = try pixelRGBA(of: rendered, x: 2, yFromBottom: 2)
+        XCTAssertEqual(renderedCorner.0, origCorner.0)
+        XCTAssertEqual(renderedCorner.2, origCorner.2)
+    }
+
+    @MainActor
+    func testSwitchingStyleDoesNotMutateExistingStrokesAndPreservesThroughUndoAndRotation() throws {
+        let original = try makeAlternatingTestImage(width: 160, height: 100)
+        let state = MosaicDocumentState()
+        state.loadImage(original, fileName: "mixed.png")
+
+        state.setEffectStyle(.blur)
+        state.setGranularity(.medium)
+        let firstRev = state.maskRevision
+        let blurStroke = MosaicStroke(
+            tool: .mosaic,
+            diameter: 24,
+            points: [CGPoint(x: 40, y: 50)],
+            effectStyle: state.effectStyle,
+            granularity: state.granularity
+        )
+        state.commitStroke(blurStroke)
+
+        // Switching style/granularity for future strokes must not alter existing strokes or force maskRevision reset
+        state.setEffectStyle(.mosaic)
+        state.setGranularity(.coarse)
+        XCTAssertEqual(state.maskRevision, firstRev)
+        XCTAssertEqual(state.strokes.first?.effectStyle, .blur)
+        XCTAssertEqual(state.strokes.first?.granularity, .medium)
+        XCTAssertNotNil(state.previewEffectImage(for: MosaicEffectSpec(style: .blur, granularity: .medium)))
+
+        let mosaicStroke = MosaicStroke(
+            tool: .rectangle,
+            rect: CGRect(x: 90, y: 20, width: 40, height: 40),
+            effectStyle: state.effectStyle,
+            granularity: state.granularity
+        )
+        state.commitStroke(mosaicStroke)
+
+        state.undo()
+        XCTAssertEqual(state.strokes.count, 1)
+        XCTAssertEqual(state.strokes[0].effectStyle, .blur)
+
+        state.redo()
+        XCTAssertEqual(state.strokes.count, 2)
+        XCTAssertEqual(state.strokes[0].effectStyle, .blur)
+        XCTAssertEqual(state.strokes[1].effectStyle, .mosaic)
+        XCTAssertEqual(state.strokes[1].granularity, .coarse)
+
+        state.beginCrop()
+        state.rotateClockwiseInCrop()
+        state.applyCrop()
+        XCTAssertEqual(state.strokes[0].effectStyle, .blur)
+        XCTAssertEqual(state.strokes[0].granularity, .medium)
+        XCTAssertEqual(state.strokes[1].effectStyle, .mosaic)
+        XCTAssertEqual(state.strokes[1].granularity, .coarse)
+    }
 }

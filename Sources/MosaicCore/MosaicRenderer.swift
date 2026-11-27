@@ -240,6 +240,16 @@ public enum MosaicRenderer {
         return ctx
     }
 
+    public static func makeSurfaceContext(drawing image: CGImage) -> CGContext? {
+        guard let ctx = makeRGBAContext(width: image.width, height: image.height) else {
+            return nil
+        }
+        let rect = CGRect(x: 0, y: 0, width: image.width, height: image.height)
+        ctx.clear(rect)
+        ctx.draw(image, in: rect)
+        return ctx
+    }
+
     private static func configureStrokeStyle(
         tool: MosaicTool,
         diameter: CGFloat,
@@ -296,6 +306,16 @@ public enum MosaicRenderer {
         context.restoreGState()
     }
 
+    public static func drawMaskSegment(
+        from p0: CGPoint,
+        to p1: CGPoint,
+        diameter: CGFloat,
+        into context: CGContext,
+        scale: CGFloat
+    ) {
+        drawSegment(from: p0, to: p1, tool: .mosaic, diameter: diameter, into: context, scale: scale)
+    }
+
     public static func drawStroke(_ stroke: MosaicStroke, into context: CGContext, scale: CGFloat) {
         if let rect = stroke.rect {
             context.saveGState()
@@ -340,6 +360,111 @@ public enum MosaicRenderer {
         context.restoreGState()
     }
 
+    public static func drawMaskStroke(_ stroke: MosaicStroke, into context: CGContext, scale: CGFloat) {
+        if let rect = stroke.rect {
+            let whiteStroke = MosaicStroke(
+                tool: .rectangle,
+                rect: rect,
+                effectStyle: stroke.effectStyle,
+                granularity: stroke.granularity
+            )
+            drawStroke(whiteStroke, into: context, scale: scale)
+            return
+        }
+        let whiteStroke = MosaicStroke(
+            tool: .mosaic,
+            diameter: stroke.diameter,
+            points: stroke.points,
+            effectStyle: stroke.effectStyle,
+            granularity: stroke.granularity
+        )
+        drawStroke(whiteStroke, into: context, scale: scale)
+    }
+
+    public static func applyMaskedSource(
+        _ source: CGImage,
+        mask: CGImage,
+        into context: CGContext,
+        in rect: CGRect
+    ) {
+        context.saveGState()
+        context.setBlendMode(.destinationOut)
+        context.draw(mask, in: rect)
+        context.restoreGState()
+
+        context.saveGState()
+        context.clip(to: rect, mask: mask)
+        context.setBlendMode(.plusLighter)
+        context.draw(source, in: rect)
+        context.restoreGState()
+    }
+
+    private enum StrokeSourceKey: Equatable {
+        case original
+        case effect(MosaicEffectSpec)
+    }
+
+    public static func renderStrokes(
+        _ strokes: [MosaicStroke],
+        onto context: CGContext,
+        width: Int,
+        height: Int,
+        scale: CGFloat,
+        original: CGImage,
+        fallbackStyle: MosaicEffectStyle,
+        fallbackGranularity: MosaicGranularity,
+        effectImageProvider: (MosaicEffectSpec) -> CGImage?
+    ) {
+        guard !strokes.isEmpty,
+              let runMaskContext = makeMaskContext(width: width, height: height) else {
+            return
+        }
+
+        let fullRect = CGRect(x: 0, y: 0, width: width, height: height)
+
+        func sourceKey(for stroke: MosaicStroke) -> StrokeSourceKey {
+            if stroke.tool == .eraser {
+                return .original
+            }
+            return .effect(
+                stroke.resolvedEffectSpec(
+                    fallbackStyle: fallbackStyle,
+                    fallbackGranularity: fallbackGranularity
+                )
+            )
+        }
+
+        var index = 0
+        while index < strokes.count {
+            let key = sourceKey(for: strokes[index])
+            var runEnd = index + 1
+            while runEnd < strokes.count && sourceKey(for: strokes[runEnd]) == key {
+                runEnd += 1
+            }
+
+            runMaskContext.clear(fullRect)
+            for strokeIndex in index..<runEnd {
+                drawMaskStroke(strokes[strokeIndex], into: runMaskContext, scale: scale)
+            }
+
+            if let maskImage = runMaskContext.makeImage() {
+                let sourceImage: CGImage?
+                switch key {
+                case .original:
+                    sourceImage = original
+                case .effect(let spec):
+                    sourceImage = effectImageProvider(spec)
+                }
+
+                if let sourceImage {
+                    applyMaskedSource(sourceImage, mask: maskImage, into: context, in: fullRect)
+                }
+            }
+
+            index = runEnd
+        }
+    }
+
     public static func composite(original: CGImage, mosaic: CGImage, mask: CGImage) -> CGImage? {
         let width = original.width
         let height = original.height
@@ -370,23 +495,38 @@ public enum MosaicRenderer {
         if strokes.isEmpty {
             maskedImage = original
         } else {
-            guard let effectLayer = makeEffectImage(
-                from: original,
-                style: style,
-                granularity: granularity,
-                originalWidth: original.width,
-                originalHeight: original.height
-            ),
-            let maskContext = makeMaskContext(width: original.width, height: original.height) else {
+            guard let surfaceContext = makeSurfaceContext(drawing: original) else {
                 return nil
             }
 
-            for stroke in strokes {
-                drawStroke(stroke, into: maskContext, scale: 1.0)
+            var effectCache: [MosaicEffectSpec: CGImage] = [:]
+            renderStrokes(
+                strokes,
+                onto: surfaceContext,
+                width: original.width,
+                height: original.height,
+                scale: 1.0,
+                original: original,
+                fallbackStyle: style,
+                fallbackGranularity: granularity
+            ) { spec in
+                if let cached = effectCache[spec] {
+                    return cached
+                }
+                guard let generated = makeEffectImage(
+                    from: original,
+                    style: spec.style,
+                    granularity: spec.granularity,
+                    originalWidth: original.width,
+                    originalHeight: original.height
+                ) else {
+                    return nil
+                }
+                effectCache[spec] = generated
+                return generated
             }
 
-            guard let maskImage = maskContext.makeImage(),
-                  let composited = composite(original: original, mosaic: effectLayer, mask: maskImage) else {
+            guard let composited = surfaceContext.makeImage() else {
                 return nil
             }
             maskedImage = composited

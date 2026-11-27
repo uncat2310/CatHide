@@ -51,10 +51,11 @@ final class CanvasInteractiveView: NSView {
     var state: MosaicDocumentState
     var onFitScaleChanged: ((CGFloat) -> Void)?
 
-    private var previewMaskContext: CGContext?
-    private var cachedMaskImage: CGImage?
+    private var baseCompositedContext: CGContext?
+    private var baseCompositedImage: CGImage?
+    private var activeStrokeMaskContext: CGContext?
+    private var cachedActiveStrokeMask: CGImage?
     private var lastImageIdentifier: ObjectIdentifier?
-    private var lastPreviewMosaicIdentifier: ObjectIdentifier?
     private var lastMaskRevision: Int = -1
     private var lastZoomMode: ZoomMode = .fit
     private var lastTool: MosaicTool = .mosaic
@@ -141,15 +142,16 @@ final class CanvasInteractiveView: NSView {
     func syncStateIfNeeded() {
         guard let original = state.originalImage,
               let previewOriginal = state.previewOriginalImage else {
-            let hadContent = previewMaskContext != nil || lastImageIdentifier != nil
-            previewMaskContext = nil
-            cachedMaskImage = nil
+            let hadContent = baseCompositedImage != nil || lastImageIdentifier != nil
+            baseCompositedContext = nil
+            baseCompositedImage = nil
+            activeStrokeMaskContext = nil
+            cachedActiveStrokeMask = nil
             activeStroke = nil
             activeSelectionStartPixel = nil
             activeSelectionRectPixel = nil
             activeCropHandle = nil
             lastImageIdentifier = nil
-            lastPreviewMosaicIdentifier = nil
             lastMaskRevision = -1
             if hadContent {
                 needsDisplay = true
@@ -158,11 +160,9 @@ final class CanvasInteractiveView: NSView {
         }
 
         let currentID = ObjectIdentifier(original)
-        let mosaicID = state.previewMosaicImage.map(ObjectIdentifier.init)
         let imageChanged = currentID != lastImageIdentifier
         let revisionChanged = state.maskRevision != lastMaskRevision
         let zoomChanged = state.zoomMode != lastZoomMode
-        let mosaicChanged = mosaicID != lastPreviewMosaicIdentifier
         let toolChanged = state.tool != lastTool
         let brushChanged = state.brushSize != lastBrushSize
         let multiImageChanged = state.isMultiImageMode != lastMultiImageMode
@@ -173,6 +173,7 @@ final class CanvasInteractiveView: NSView {
 
         if croppingChanged || toolChanged || imageChanged {
             activeStroke = nil
+            cachedActiveStrokeMask = nil
             activeSelectionStartPixel = nil
             activeSelectionRectPixel = nil
             activeCropHandle = nil
@@ -189,28 +190,34 @@ final class CanvasInteractiveView: NSView {
             )
         }
 
-        if imageChanged || revisionChanged || (!state.strokes.isEmpty && previewMaskContext == nil) {
-            cachedMaskImage = nil
+        if imageChanged || revisionChanged || (!state.strokes.isEmpty && baseCompositedImage == nil) {
+            cachedActiveStrokeMask = nil
             if state.strokes.isEmpty {
-                previewMaskContext = nil
-            } else {
-                let ctx = MosaicRenderer.makeMaskContext(
+                baseCompositedContext = nil
+                baseCompositedImage = nil
+            } else if let ctx = MosaicRenderer.makeSurfaceContext(drawing: previewOriginal) {
+                MosaicRenderer.renderStrokes(
+                    state.strokes,
+                    onto: ctx,
                     width: previewOriginal.width,
-                    height: previewOriginal.height
-                )
-                if let ctx {
-                    for stroke in state.strokes {
-                        MosaicRenderer.drawStroke(stroke, into: ctx, scale: state.previewScale)
-                    }
+                    height: previewOriginal.height,
+                    scale: state.previewScale,
+                    original: previewOriginal,
+                    fallbackStyle: state.effectStyle,
+                    fallbackGranularity: state.granularity
+                ) { spec in
+                    state.previewEffectImage(for: spec)
                 }
-                previewMaskContext = ctx
-                cachedMaskImage = ctx?.makeImage()
+                baseCompositedContext = ctx
+                baseCompositedImage = ctx.makeImage()
+            }
+            if imageChanged {
+                activeStrokeMaskContext = nil
             }
             lastImageIdentifier = currentID
             lastMaskRevision = state.maskRevision
         }
 
-        lastPreviewMosaicIdentifier = mosaicID
         lastZoomMode = state.zoomMode
         lastTool = state.tool
         lastBrushSize = state.brushSize
@@ -226,7 +233,7 @@ final class CanvasInteractiveView: NSView {
 
         reportFitScale()
 
-        if imageChanged || revisionChanged || zoomChanged || mosaicChanged || toolChanged
+        if imageChanged || revisionChanged || zoomChanged || toolChanged
             || brushChanged || multiImageChanged || croppingChanged || cropChanged
             || draftCropChanged || compareChanged {
             needsDisplay = true
@@ -559,20 +566,27 @@ final class CanvasInteractiveView: NSView {
         imageRect.intersection(clipRect).fill()
         NSGraphicsContext.restoreGraphicsState()
 
-        // Draw base image and masked effect overlay clipped to active crop rect
-        if let cgContext = NSGraphicsContext.current?.cgContext {
+        // Draw composited preview (or original while comparing) clipped to active crop rect
+        let drawClip = imageRect.intersection(clipRect)
+        if let cgContext = NSGraphicsContext.current?.cgContext, !drawClip.isEmpty {
             cgContext.saveGState()
-            cgContext.clip(to: imageRect.intersection(clipRect))
+            cgContext.clip(to: drawClip)
             cgContext.interpolationQuality = .high
-            cgContext.draw(previewOriginal, in: fullDrawRect)
 
-            if !state.isComparingOriginal,
-               let mask = cachedMaskImage,
-               let previewMosaic = state.previewMosaicImage {
-                cgContext.saveGState()
-                cgContext.clip(to: fullDrawRect, mask: mask)
-                cgContext.draw(previewMosaic, in: fullDrawRect)
-                cgContext.restoreGState()
+            if state.isComparingOriginal {
+                cgContext.draw(previewOriginal, in: fullDrawRect)
+            } else {
+                let baseImage = baseCompositedImage ?? previewOriginal
+                if let activeStroke,
+                   let activeMask = cachedActiveStrokeMask,
+                   let activeSource = sourceImage(for: activeStroke, previewOriginal: previewOriginal) {
+                    cgContext.beginTransparencyLayer(in: drawClip, auxiliaryInfo: nil)
+                    cgContext.draw(baseImage, in: fullDrawRect)
+                    MosaicRenderer.applyMaskedSource(activeSource, mask: activeMask, into: cgContext, in: fullDrawRect)
+                    cgContext.endTransparencyLayer()
+                } else {
+                    cgContext.draw(baseImage, in: fullDrawRect)
+                }
             }
             cgContext.restoreGState()
         }
@@ -813,21 +827,23 @@ final class CanvasInteractiveView: NSView {
         let stroke = MosaicStroke(
             tool: state.tool,
             diameter: state.brushDiameterInOriginalPixels,
-            points: [pixelPoint]
+            points: [pixelPoint],
+            effectStyle: state.effectStyle,
+            granularity: state.granularity
         )
         activeStroke = stroke
 
-        if let previewMaskContext = ensurePreviewMaskContext() {
-            cachedMaskImage = nil
-            MosaicRenderer.drawSegment(
+        if let strokeMaskCtx = ensureActiveStrokeMaskContext() {
+            cachedActiveStrokeMask = nil
+            strokeMaskCtx.clear(CGRect(x: 0, y: 0, width: strokeMaskCtx.width, height: strokeMaskCtx.height))
+            MosaicRenderer.drawMaskSegment(
                 from: pixelPoint,
                 to: pixelPoint,
-                tool: stroke.tool,
                 diameter: stroke.diameter,
-                into: previewMaskContext,
+                into: strokeMaskCtx,
                 scale: state.previewScale
             )
-            cachedMaskImage = previewMaskContext.makeImage()
+            cachedActiveStrokeMask = strokeMaskCtx.makeImage()
             let dirty = segmentDirtyRect(
                 from: pixelPoint,
                 to: pixelPoint,
@@ -839,16 +855,41 @@ final class CanvasInteractiveView: NSView {
         }
     }
 
-    private func ensurePreviewMaskContext() -> CGContext? {
-        if let existing = previewMaskContext {
+    private func sourceImage(for stroke: MosaicStroke, previewOriginal: CGImage) -> CGImage? {
+        if stroke.tool == .eraser {
+            return previewOriginal
+        }
+        let spec = stroke.resolvedEffectSpec(
+            fallbackStyle: state.effectStyle,
+            fallbackGranularity: state.granularity
+        )
+        return state.previewEffectImage(for: spec)
+    }
+
+    private func ensureActiveStrokeMaskContext() -> CGContext? {
+        guard let previewOriginal = state.previewOriginalImage else { return nil }
+        if let existing = activeStrokeMaskContext,
+           existing.width == previewOriginal.width,
+           existing.height == previewOriginal.height {
             return existing
         }
-        guard let previewOriginal = state.previewOriginalImage else { return nil }
         let ctx = MosaicRenderer.makeMaskContext(
             width: previewOriginal.width,
             height: previewOriginal.height
         )
-        previewMaskContext = ctx
+        activeStrokeMaskContext = ctx
+        return ctx
+    }
+
+    private func ensureBaseCompositedContext() -> CGContext? {
+        guard let previewOriginal = state.previewOriginalImage else { return nil }
+        if let existing = baseCompositedContext,
+           existing.width == previewOriginal.width,
+           existing.height == previewOriginal.height {
+            return existing
+        }
+        let ctx = MosaicRenderer.makeSurfaceContext(drawing: previewOriginal)
+        baseCompositedContext = ctx
         return ctx
     }
 
@@ -922,17 +963,16 @@ final class CanvasInteractiveView: NSView {
         stroke.points.append(pixelPoint)
         activeStroke = stroke
 
-        if let previewMaskContext = ensurePreviewMaskContext() {
-            cachedMaskImage = nil
-            MosaicRenderer.drawSegment(
+        if let strokeMaskCtx = ensureActiveStrokeMaskContext() {
+            cachedActiveStrokeMask = nil
+            MosaicRenderer.drawMaskSegment(
                 from: previousPoint,
                 to: pixelPoint,
-                tool: stroke.tool,
                 diameter: stroke.diameter,
-                into: previewMaskContext,
+                into: strokeMaskCtx,
                 scale: state.previewScale
             )
-            cachedMaskImage = previewMaskContext.makeImage()
+            cachedActiveStrokeMask = strokeMaskCtx.makeImage()
         }
 
         let dirty = segmentDirtyRect(
@@ -964,11 +1004,27 @@ final class CanvasInteractiveView: NSView {
             activeSelectionStartPixel = nil
             activeSelectionRectPixel = nil
             if let finalRect, finalRect.width >= 2, finalRect.height >= 2 {
-                let stroke = MosaicStroke(tool: .rectangle, rect: finalRect)
-                if let ctx = ensurePreviewMaskContext() {
-                    cachedMaskImage = nil
-                    MosaicRenderer.drawStroke(stroke, into: ctx, scale: state.previewScale)
-                    cachedMaskImage = ctx.makeImage()
+                let stroke = MosaicStroke(
+                    tool: .rectangle,
+                    rect: finalRect,
+                    effectStyle: state.effectStyle,
+                    granularity: state.granularity
+                )
+                if let previewOriginal = state.previewOriginalImage,
+                   let baseCtx = ensureBaseCompositedContext() {
+                    MosaicRenderer.renderStrokes(
+                        [stroke],
+                        onto: baseCtx,
+                        width: previewOriginal.width,
+                        height: previewOriginal.height,
+                        scale: state.previewScale,
+                        original: previewOriginal,
+                        fallbackStyle: state.effectStyle,
+                        fallbackGranularity: state.granularity
+                    ) { spec in
+                        state.previewEffectImage(for: spec)
+                    }
+                    baseCompositedImage = baseCtx.makeImage()
                 }
                 state.commitStroke(stroke)
             }
@@ -977,8 +1033,23 @@ final class CanvasInteractiveView: NSView {
         }
 
         if let stroke = activeStroke {
+            if let mask = cachedActiveStrokeMask,
+               let previewOriginal = state.previewOriginalImage,
+               let activeSource = sourceImage(for: stroke, previewOriginal: previewOriginal),
+               let baseCtx = ensureBaseCompositedContext() {
+                let fullPreviewRect = CGRect(
+                    x: 0,
+                    y: 0,
+                    width: previewOriginal.width,
+                    height: previewOriginal.height
+                )
+                MosaicRenderer.applyMaskedSource(activeSource, mask: mask, into: baseCtx, in: fullPreviewRect)
+                baseCompositedImage = baseCtx.makeImage()
+            }
             activeStroke = nil
+            cachedActiveStrokeMask = nil
             state.commitStroke(stroke)
+            needsDisplay = true
         }
     }
 

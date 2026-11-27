@@ -198,24 +198,62 @@ public enum ZoomMode: Equatable, Sendable {
     case custom(CGFloat)
 }
 
+public struct MosaicEffectSpec: Equatable, Hashable, Sendable {
+    public let style: MosaicEffectStyle
+    public let granularity: MosaicGranularity
+
+    public init(style: MosaicEffectStyle, granularity: MosaicGranularity) {
+        self.style = style
+        self.granularity = granularity
+    }
+}
+
 public struct MosaicStroke: Equatable, Sendable {
     public let tool: MosaicTool
     public let diameter: CGFloat
     public var points: [CGPoint]
     public let rect: CGRect?
+    public let effectStyle: MosaicEffectStyle?
+    public let granularity: MosaicGranularity?
 
-    public init(tool: MosaicTool, diameter: CGFloat, points: [CGPoint] = [], rect: CGRect? = nil) {
+    public init(
+        tool: MosaicTool,
+        diameter: CGFloat,
+        points: [CGPoint] = [],
+        rect: CGRect? = nil,
+        effectStyle: MosaicEffectStyle? = nil,
+        granularity: MosaicGranularity? = nil
+    ) {
         self.tool = tool
         self.diameter = diameter
         self.points = points
         self.rect = rect
+        self.effectStyle = effectStyle
+        self.granularity = granularity
     }
 
-    public init(tool: MosaicTool, rect: CGRect) {
+    public init(
+        tool: MosaicTool,
+        rect: CGRect,
+        effectStyle: MosaicEffectStyle? = nil,
+        granularity: MosaicGranularity? = nil
+    ) {
         self.tool = tool
         self.diameter = 0
         self.points = []
         self.rect = rect
+        self.effectStyle = effectStyle
+        self.granularity = granularity
+    }
+
+    public func resolvedEffectSpec(
+        fallbackStyle: MosaicEffectStyle,
+        fallbackGranularity: MosaicGranularity
+    ) -> MosaicEffectSpec {
+        MosaicEffectSpec(
+            style: effectStyle ?? fallbackStyle,
+            granularity: granularity ?? fallbackGranularity
+        )
     }
 }
 
