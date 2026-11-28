@@ -35,7 +35,7 @@ struct GuideSheetView: View {
                 GuideRow(
                     symbol: "photo.on.rectangle.angled",
                     title: "导入与粘贴",
-                    detail: "拖入单张、多张图片或整个文件夹即可开始；也支持直接粘贴剪贴板截图，完成后可一键返回主页。",
+                    detail: "拖入图片、PDF 或整个文件夹即可开始（加密 PDF 会先询问密码）；也支持直接粘贴剪贴板截图，完成后可一键返回主页。",
                     keycaps: [
                         shortcutStore.combo(for: .openImage).displayString,
                         shortcutStore.combo(for: .pasteImage).displayString,
@@ -56,6 +56,15 @@ struct GuideSheetView: View {
                 )
 
                 GuideRow(
+                    symbol: "text.viewfinder",
+                    title: "自动识别隐私信息",
+                    detail: "一键找出手机号、地址、姓名、证件号、银行卡、二维码等，先以方框预览；点方框可跳过某一处，确认后一次打码，撤销一次即可全部还原。PDF 可同时处理全部页面。全部在本机完成，不上传。",
+                    keycaps: [
+                        shortcutStore.combo(for: .autoDetect).displayString
+                    ]
+                )
+
+                GuideRow(
                     symbol: "hand.draw",
                     title: "缩放、对比原图与多图管理",
                     detail: "滚轮、双指捏合或拖动右下角缩放胶囊均可缩放（放大后多图条自动收成底部胶囊），按住「\\」可随时透视原图对比。",
@@ -69,7 +78,7 @@ struct GuideSheetView: View {
                 GuideRow(
                     symbol: "square.and.arrow.up",
                     title: "单张与批量导出",
-                    detail: "导出单张后自动切到下一张未处理图片，也支持将已打码图片一键批量导出。",
+                    detail: "导出单张后自动切到下一张未处理图片，也支持一键批量导出。PDF 导出为只含图像的 PDF，被遮住的文字不会留在文件里；也可只导出当前页为 PNG / JPEG。",
                     keycaps: [
                         shortcutStore.combo(for: .exportCurrent).displayString,
                         shortcutStore.combo(for: .batchExport).displayString

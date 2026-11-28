@@ -586,10 +586,10 @@ public enum MosaicRenderer {
             if let values = try? url.resourceValues(forKeys: [.contentTypeKey, .isRegularFileKey]),
                values.isRegularFile == true,
                let type = values.contentType {
-                return type.conforms(to: .image)
+                return type.conforms(to: .image) || type.conforms(to: .pdf)
             }
             if let extType = UTType(filenameExtension: url.pathExtension) {
-                return extType.conforms(to: .image)
+                return extType.conforms(to: .image) || extType.conforms(to: .pdf)
             }
             return false
         }

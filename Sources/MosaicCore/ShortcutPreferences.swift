@@ -76,6 +76,7 @@ public enum AppShortcutAction: String, CaseIterable, Identifiable, Codable, Send
     case toolRectangle
     case toolEraser
     case toggleCrop
+    case autoDetect
     case brushSmaller
     case brushLarger
 
@@ -106,13 +107,14 @@ public enum AppShortcutAction: String, CaseIterable, Identifiable, Codable, Send
         case .toolRectangle: "框选打码"
         case .toolEraser: "橡皮擦"
         case .toggleCrop: "裁剪图片"
+        case .autoDetect: "自动识别隐私信息"
         case .brushSmaller: "减小笔刷"
         case .brushLarger: "增大笔刷"
-        case .openImage: "打开图片或文件夹"
-        case .removeCurrentImage: "从列表移除当前图片"
+        case .openImage: "打开文件或文件夹"
+        case .removeCurrentImage: "从列表移除当前项"
         case .closeToHome: "关闭图片并返回主界面"
-        case .exportCurrent: "导出当前图片"
-        case .batchExport: "批量导出已打码图片"
+        case .exportCurrent: "导出当前文件"
+        case .batchExport: "批量导出已打码文件"
         case .undo: "撤销"
         case .redo: "重做"
         case .clearAll: "清空打码"
@@ -129,7 +131,7 @@ public enum AppShortcutAction: String, CaseIterable, Identifiable, Codable, Send
 
     public var group: AppShortcutGroup {
         switch self {
-        case .toolMosaic, .toolRectangle, .toolEraser, .toggleCrop, .brushSmaller, .brushLarger:
+        case .toolMosaic, .toolRectangle, .toolEraser, .toggleCrop, .autoDetect, .brushSmaller, .brushLarger:
             .tools
         case .openImage, .removeCurrentImage, .closeToHome, .exportCurrent, .batchExport:
             .file
@@ -146,6 +148,7 @@ public enum AppShortcutAction: String, CaseIterable, Identifiable, Codable, Send
         case .toolRectangle: ShortcutCombo(key: "r")
         case .toolEraser: ShortcutCombo(key: "e")
         case .toggleCrop: ShortcutCombo(key: "c")
+        case .autoDetect: ShortcutCombo(key: "a")
         case .brushSmaller: ShortcutCombo(key: "[")
         case .brushLarger: ShortcutCombo(key: "]")
         case .openImage: ShortcutCombo(key: "o", modifiers: .command)

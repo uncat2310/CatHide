@@ -83,7 +83,19 @@ struct ContentView: View {
 
                 FloatingGlassGroup(spacing: 10) {
                     VStack(spacing: 2) {
-                        if let toast = state.toastMessage {
+                        if let busy = state.busyMessage {
+                            HStack(spacing: 8) {
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text(busy)
+                                    .font(.callout.weight(.medium))
+                            }
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                            .floatingGlassCapsule()
+                            .padding(.bottom, 8)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                        } else if let toast = state.toastMessage {
                             Text(toast)
                                 .font(.callout.weight(.medium))
                                 .padding(.horizontal, 14)
@@ -97,6 +109,8 @@ struct ContentView: View {
                         if state.hasImage {
                             if state.isCropping {
                                 floatingCropPill
+                            } else if let session = state.suggestions {
+                                SuggestionPill(state: state, session: session)
                             } else {
                                 floatingControlPill
                             }
@@ -147,6 +161,8 @@ struct ContentView: View {
             }
         }
         .animation(.easeOut(duration: 0.18), value: state.toastMessage)
+        .animation(.easeOut(duration: 0.18), value: state.busyMessage)
+        .animation(.spring(response: 0.26, dampingFraction: 0.86), value: state.suggestions != nil)
         .onChange(of: isZoomedBeyondFit) { _, zoomed in
             if !zoomed {
                 state.isFilmstripExpandedWhileZoomed = false
@@ -177,20 +193,20 @@ struct ContentView: View {
                             .accessibilityLabel("打开")
                     }
                     .disabled(state.isCropping)
-                    .help("打开图片或文件夹 (\(shortcutStore.combo(for: .openImage).displayString))")
+                    .help("打开图片、PDF 或文件夹 (\(shortcutStore.combo(for: .openImage).displayString))")
 
                     if state.isMultiImageMode {
                         Menu {
                             Button {
                                 saveImagePanel()
                             } label: {
-                                Label("导出当前图", systemImage: "photo")
+                                Label(state.currentPDFPage == nil ? "导出当前图" : "导出当前 PDF", systemImage: state.currentPDFPage == nil ? "photo" : "doc.richtext")
                             }
 
                             Button {
                                 batchExportPanel()
                             } label: {
-                                Label("批量导出（\(state.modifiedCount) 张）", systemImage: "square.stack")
+                                Label("批量导出（\(state.batchExportCount) 个文件）", systemImage: "square.stack")
                             }
                         } label: {
                             Image(systemName: "square.and.arrow.up")
@@ -214,7 +230,12 @@ struct ContentView: View {
                 }
 
                 ToolbarItem(placement: .principal) {
-                    TitleRenameView(state: state)
+                    HStack(spacing: 8) {
+                        TitleRenameView(state: state)
+                        if let page = state.pageNumber, page.total > 1 {
+                            PDFPagerView(state: state, current: page.current, total: page.total)
+                        }
+                    }
                 }
 
                 ToolbarItemGroup(placement: .primaryAction) {
@@ -243,6 +264,22 @@ struct ContentView: View {
                     .help("清空所有打码 (\(shortcutStore.combo(for: .clearAll).displayString))")
 
                     Button {
+                        if state.suggestions != nil {
+                            state.cancelSuggestions()
+                        } else {
+                            Task { await state.startAutoDetect() }
+                        }
+                    } label: {
+                        Image(systemName: "text.viewfinder")
+                            .foregroundStyle(state.suggestions != nil ? Color.accentColor : Color.primary)
+                            .accessibilityLabel("自动识别")
+                    }
+                    .disabled(!state.canAutoDetect)
+                    .help(state.suggestions != nil
+                          ? "取消自动识别 (Esc)"
+                          : "自动识别隐私信息：手机号、地址、姓名、证件号、二维码… (\(shortcutStore.combo(for: .autoDetect).displayString))")
+
+                    Button {
                         if state.isCropping {
                             state.cancelCrop()
                         } else {
@@ -257,7 +294,8 @@ struct ContentView: View {
                             )
                             .accessibilityLabel("裁剪")
                     }
-                    .help("裁剪与旋转 (\(shortcutStore.combo(for: .toggleCrop).displayString))")
+                    .disabled(!state.canCrop && !state.isCropping)
+                    .help(state.currentPDFPage != nil ? "PDF 页面保持原尺寸，不能裁剪" : "裁剪与旋转 (\(shortcutStore.combo(for: .toggleCrop).displayString))")
 
                     Image(systemName: state.isComparingOriginal ? "eye.fill" : "eye")
                         .font(.system(size: 13.5, weight: .regular))
@@ -331,7 +369,7 @@ struct ContentView: View {
                 requestCloseToHome()
             }
         }
-        .alert("还有 \(state.unsavedCount) 张已编辑图片未导出", isPresented: $showUnsavedCloseAlert) {
+        .alert("还有 \(state.unsavedCount) 张已编辑的图片或页面未导出", isPresented: $showUnsavedCloseAlert) {
             Button("仍然返回", role: .destructive) {
                 state.closeAllImages()
             }
@@ -339,11 +377,11 @@ struct ContentView: View {
         } message: {
             Text("返回主界面后，未导出的打码和裁剪修改将会丢失。")
         }
-        .confirmationDialog("当前已有打开的图片", isPresented: $showDropChoiceDialog, titleVisibility: .visible) {
+        .confirmationDialog("当前已有打开的文件", isPresented: $showDropChoiceDialog, titleVisibility: .visible) {
             Button("追加到当前列表") {
                 commitPendingDrop(append: true)
             }
-            Button("替换为新图片", role: .destructive) {
+            Button("替换为新文件", role: .destructive) {
                 commitPendingDrop(append: false)
             }
             Button("取消", role: .cancel) {
@@ -351,7 +389,7 @@ struct ContentView: View {
                 pendingDropItems.removeAll()
             }
         } message: {
-            Text("是否将新拖入的图片追加到当前队列，还是直接替换？")
+            Text("是否将新拖入的文件追加到当前列表，还是直接替换？")
         }
         .onReceive(NotificationCenter.default.publisher(for: .catHideZoomIn)) { _ in
             if state.hasImage {
@@ -373,6 +411,9 @@ struct ContentView: View {
             }
         }
         .onAppear {
+            state.pdfPasswordProvider = { name, wrongBefore in
+                PDFPasswordPrompt.ask(fileName: name, wrongBefore: wrongBefore)
+            }
             guard !hasHandledInitialAppear else { return }
             hasHandledInitialAppear = true
             if !suppressLaunchGuide {
@@ -598,10 +639,10 @@ struct ContentView: View {
                     .shadow(color: .black.opacity(colorScheme == .dark ? 0.28 : 0.10), radius: 12, y: 4)
 
                 VStack(spacing: 6) {
-                    Text(isDropTargeted ? "松开即可导入图片" : "拖放图片或文件夹到此处开始打码")
+                    Text(isDropTargeted ? "松开即可导入" : "拖放图片、PDF 或文件夹到此处开始打码")
                         .font(.title3.weight(.medium))
 
-                    Text("支持拖入单张、多张图片或整个文件夹")
+                    Text("支持单张或多张图片、PDF（含加密 PDF）和整个文件夹")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
@@ -616,7 +657,7 @@ struct ContentView: View {
                                     .font(.system(size: 13.5, weight: .medium))
                                     .frame(width: 16, height: 16)
                                     .foregroundStyle(Color.accentColor)
-                                Text("打开图片…")
+                                Text("打开文件…")
                                     .fontWeight(.medium)
                             }
                             .frame(width: 136)
@@ -668,7 +709,7 @@ struct ContentView: View {
         panel.canChooseFiles = true
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = true
-        panel.allowedContentTypes = [.image]
+        panel.allowedContentTypes = [.image, .pdf]
         panel.prompt = "打开"
 
         if panel.runModal() == .OK, !panel.urls.isEmpty {
@@ -741,6 +782,10 @@ struct ContentView: View {
     }
 
     private func saveImagePanel() {
+        if let page = state.currentPDFPage {
+            savePDFPanel(page: page)
+            return
+        }
         let initialFormat = preferredExportFormat
         let panel = NSSavePanel()
         panel.canCreateDirectories = true
@@ -769,6 +814,45 @@ struct ContentView: View {
         }
     }
 
+    /// A PDF exports whole (pictures only) or just the current page as PNG / JPEG.
+    private func savePDFPanel(page: PDFPageRef) {
+        let panel = NSSavePanel()
+        panel.canCreateDirectories = true
+        panel.allowedContentTypes = [.pdf]
+        panel.directoryURL = rememberedExportDirectoryURL() ?? page.url.deletingLastPathComponent()
+        panel.nameFieldStringValue = state.suggestedExportFileName(fileExtension: "pdf", wholePDF: true)
+        panel.prompt = "导出"
+        panel.message = "导出的 PDF 只含图像：被遮住的文字不会留在文件里，也无法再被选中或搜索。"
+
+        let total = state.pageNumber?.total ?? 1
+        let accessory = PDFExportAccessoryController(pageCount: total) { choice in
+            let stem = (panel.nameFieldStringValue as NSString).deletingPathExtension
+            switch choice {
+            case .wholePDF:
+                panel.allowedContentTypes = [.pdf]
+                panel.nameFieldStringValue = state.suggestedExportFileName(fileExtension: "pdf", wholePDF: true)
+            case .pagePNG, .pageJPEG:
+                let format: ExportFormat = choice == .pagePNG ? .png : .jpeg
+                lastExportFormatRaw = format.rawValue
+                panel.allowedContentTypes = [format == .png ? .png : .jpeg]
+                let base = stem.isEmpty ? "cathide" : stem
+                panel.nameFieldStringValue = base.contains("_p")
+                    ? "\(base).\(format.fileExtension)"
+                    : state.suggestedExportFileName(fileExtension: format.fileExtension, wholePDF: false)
+            }
+        }
+        panel.accessoryView = accessory.view
+
+        if panel.runModal() == .OK, let url = panel.url {
+            UserDefaults.standard.set(url.deletingLastPathComponent().path, forKey: Self.lastExportDirectoryKey)
+            do {
+                try state.exportImage(to: url)
+            } catch {
+                state.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
     private func batchExportPanel() {
         guard state.modifiedCount > 0 else {
             state.showToast("当前没有已打码或编辑过的图片")
@@ -783,7 +867,7 @@ struct ContentView: View {
         panel.canCreateDirectories = true
         panel.directoryURL = rememberedExportDirectoryURL() ?? state.sourceURL?.deletingLastPathComponent()
         panel.prompt = "导出到此文件夹"
-        panel.message = "将批量导出 \(state.modifiedCount) 张已打码/已裁剪图片"
+        panel.message = "将批量导出 \(state.batchExportCount) 个已编辑文件（编辑过的 PDF 各导出为一个只含图像的 PDF）"
 
         var chosenFormat: ExportFormat = initialFormat
         let formatAccessory = ExportFormatAccessoryController(initialFormat: initialFormat) { selectedFormat in

@@ -48,7 +48,7 @@ struct FilmstripBarView: View {
                 ChevronNavButton(
                     systemImage: "chevron.left",
                     enabled: state.canSelectPrevious,
-                    helpText: "上一张 (\(shortcutStore.combo(for: .previousImage).displayString))"
+                    helpText: "上一项 (\(shortcutStore.combo(for: .previousImage).displayString))"
                 ) {
                     state.selectPrevious()
                 }
@@ -66,6 +66,15 @@ struct FilmstripBarView: View {
                                     isDragging: isDraggingStrip,
                                     transform: tileTransform
                                 )
+                                .overlay(alignment: .leading) {
+                                    if startsNewFile(at: index) {
+                                        Capsule()
+                                            .fill(Color.primary.opacity(0.28))
+                                            .frame(width: 1.5, height: tileSize * 0.78)
+                                            .offset(x: -tileSpacing / 2 - 0.75)
+                                            .allowsHitTesting(false)
+                                    }
+                                }
                                 .id(item.id)
                                 .zIndex(Double(tileTransform.scale * 10) + (index == state.currentIndex ? 1.0 : 0.0))
                                 .contextMenu {
@@ -122,7 +131,7 @@ struct FilmstripBarView: View {
                 ChevronNavButton(
                     systemImage: "chevron.right",
                     enabled: state.canSelectNext,
-                    helpText: "下一张 (\(shortcutStore.combo(for: .nextImage).displayString))"
+                    helpText: "下一项 (\(shortcutStore.combo(for: .nextImage).displayString))"
                 ) {
                     state.selectNext()
                 }
@@ -156,6 +165,16 @@ struct FilmstripBarView: View {
             }
         }
         .frame(height: useGlassDock ? 80 : 94)
+    }
+
+    /// A divider goes where one file ends and another begins, when a PDF is involved
+    /// (a PDF's pages sit together; plain images need no separators).
+    private func startsNewFile(at index: Int) -> Bool {
+        guard index > 0, state.queue.indices.contains(index) else { return false }
+        let a = state.queue[index - 1].pdfPage
+        let b = state.queue[index].pdfPage
+        if a == nil && b == nil { return false }
+        return a?.documentID != b?.documentID
     }
 
     private func cardTransform(for index: Int) -> DockCardTransform {
@@ -269,7 +288,7 @@ private struct ThumbnailTile: View {
                 } else {
                     Color.secondary.opacity(0.14)
                         .overlay {
-                            Image(systemName: "photo")
+                            Image(systemName: item.pdfPage == nil ? "photo" : "doc.text")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -290,6 +309,18 @@ private struct ThumbnailTile: View {
                 y: isWaveActive ? 3 : (isSelected ? 2 : 1)
             )
 
+            if let page = item.pdfPage {
+                Text("\(page.pageIndex + 1)")
+                    .font(.system(size: 9, weight: .bold).monospacedDigit())
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 4)
+                    .frame(minWidth: 14, minHeight: 13)
+                    .background(Color.black.opacity(0.55), in: Capsule())
+                    .padding(3)
+                    .frame(width: size, height: size, alignment: .bottomLeading)
+                    .allowsHitTesting(false)
+            }
+
             if item.isExported {
                 Image(systemName: "checkmark.circle.fill")
                     .font(.system(size: 12))
@@ -308,6 +339,6 @@ private struct ThumbnailTile: View {
         .animation(isDragging ? nil : .interactiveSpring(response: 0.20, dampingFraction: 0.80), value: transform)
         .animation(.easeOut(duration: 0.12), value: isSelected)
         .contentShape(Rectangle())
-        .help(item.fileName)
+        .help(item.pdfPage.map { "\(item.fileName) · 第 \($0.pageIndex + 1) 页" } ?? item.fileName)
     }
 }

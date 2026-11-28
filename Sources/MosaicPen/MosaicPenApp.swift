@@ -124,13 +124,13 @@ struct CatHideApp: App {
             }
 
             CommandGroup(replacing: .newItem) {
-                Button("打开图片或文件夹…") {
+                Button("打开文件或文件夹…") {
                     NotificationCenter.default.post(name: .catHideOpenImage, object: nil)
                 }
                 .applyShortcut(shortcutStore.combo(for: .openImage))
                 .disabled(isActionDisabled(.openImage))
 
-                Button("从列表移除当前图片") {
+                Button("从列表移除当前项") {
                     state.removeItem(at: state.currentIndex)
                 }
                 .applyShortcut(shortcutStore.combo(for: .removeCurrentImage))
@@ -144,13 +144,13 @@ struct CatHideApp: App {
             }
 
             CommandGroup(replacing: .saveItem) {
-                Button("导出当前图片…") {
+                Button("导出当前文件…") {
                     NotificationCenter.default.post(name: .catHideExportImage, object: nil)
                 }
                 .applyShortcut(shortcutStore.combo(for: .exportCurrent))
                 .disabled(isActionDisabled(.exportCurrent, baseDisabled: !state.hasImage || state.isCropping))
 
-                Button("批量导出已打码图片…") {
+                Button("批量导出已打码文件…") {
                     NotificationCenter.default.post(name: .catHideBatchExport, object: nil)
                 }
                 .applyShortcut(shortcutStore.combo(for: .batchExport))
@@ -222,7 +222,17 @@ struct CatHideApp: App {
                     }
                 }
                 .applyShortcut(shortcutStore.combo(for: .toggleCrop))
-                .disabled(isActionDisabled(.toggleCrop, baseDisabled: !state.hasImage))
+                .disabled(isActionDisabled(.toggleCrop, baseDisabled: !state.canCrop && !state.isCropping))
+
+                Button(state.suggestions == nil ? "自动识别隐私信息" : "取消自动识别") {
+                    if state.suggestions != nil {
+                        state.cancelSuggestions()
+                    } else {
+                        Task { await state.startAutoDetect() }
+                    }
+                }
+                .applyShortcut(shortcutStore.combo(for: .autoDetect))
+                .disabled(isActionDisabled(.autoDetect, baseDisabled: !state.canAutoDetect))
 
                 Divider()
 
@@ -251,6 +261,18 @@ struct CatHideApp: App {
                 }
                 .applyShortcut(shortcutStore.combo(for: .nextImage))
                 .disabled(isActionDisabled(.nextImage, baseDisabled: !state.canSelectNext))
+
+                Button("上一页") {
+                    state.selectPreviousPage()
+                }
+                .keyboardShortcut(.pageUp, modifiers: [])
+                .disabled(state.currentPDFPage == nil ? !state.canSelectPrevious : !state.canSelectPreviousPage)
+
+                Button("下一页") {
+                    state.selectNextPage()
+                }
+                .keyboardShortcut(.pageDown, modifiers: [])
+                .disabled(state.currentPDFPage == nil ? !state.canSelectNext : !state.canSelectNextPage)
 
                 Divider()
 

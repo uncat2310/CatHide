@@ -26,8 +26,8 @@ public enum MosaicTool: String, CaseIterable, Identifiable, Sendable {
 }
 
 public enum MosaicEffectStyle: String, CaseIterable, Identifiable, Sendable {
-    case mosaic
     case blur
+    case mosaic
     case solid
 
     public var id: String { rawValue }
@@ -215,6 +215,8 @@ public struct MosaicStroke: Equatable, Sendable {
     public let rect: CGRect?
     public let effectStyle: MosaicEffectStyle?
     public let granularity: MosaicGranularity?
+    /// Strokes added together (one 自动识别 apply) share a group and undo as one step.
+    public let group: Int?
 
     public init(
         tool: MosaicTool,
@@ -222,7 +224,8 @@ public struct MosaicStroke: Equatable, Sendable {
         points: [CGPoint] = [],
         rect: CGRect? = nil,
         effectStyle: MosaicEffectStyle? = nil,
-        granularity: MosaicGranularity? = nil
+        granularity: MosaicGranularity? = nil,
+        group: Int? = nil
     ) {
         self.tool = tool
         self.diameter = diameter
@@ -230,13 +233,15 @@ public struct MosaicStroke: Equatable, Sendable {
         self.rect = rect
         self.effectStyle = effectStyle
         self.granularity = granularity
+        self.group = group
     }
 
     public init(
         tool: MosaicTool,
         rect: CGRect,
         effectStyle: MosaicEffectStyle? = nil,
-        granularity: MosaicGranularity? = nil
+        granularity: MosaicGranularity? = nil,
+        group: Int? = nil
     ) {
         self.tool = tool
         self.diameter = 0
@@ -244,6 +249,7 @@ public struct MosaicStroke: Equatable, Sendable {
         self.rect = rect
         self.effectStyle = effectStyle
         self.granularity = granularity
+        self.group = group
     }
 
     public func resolvedEffectSpec(
@@ -271,6 +277,8 @@ public struct MosaicQueueItem: Identifiable, Sendable {
     public var hasCustomFileName: Bool
     public var inMemoryImage: CGImage?
     public var thumbnail: CGImage?
+    /// Set when this item is one page of a PDF.
+    public var pdfPage: PDFPageRef?
 
     public var hasEdits: Bool {
         !strokes.isEmpty || !cropRect.isFull || rotationQuarterTurns != 0
@@ -283,13 +291,14 @@ public struct MosaicQueueItem: Identifiable, Sendable {
         strokes: [MosaicStroke] = [],
         redoStack: [MosaicStroke] = [],
         granularity: MosaicGranularity = .medium,
-        effectStyle: MosaicEffectStyle = .mosaic,
+        effectStyle: MosaicEffectStyle = .blur,
         cropRect: NormalizedCropRect = .full,
         rotationQuarterTurns: Int = 0,
         isExported: Bool = false,
         hasCustomFileName: Bool = false,
         inMemoryImage: CGImage? = nil,
-        thumbnail: CGImage? = nil
+        thumbnail: CGImage? = nil,
+        pdfPage: PDFPageRef? = nil
     ) {
         self.id = id
         self.sourceURL = sourceURL
@@ -304,6 +313,7 @@ public struct MosaicQueueItem: Identifiable, Sendable {
         self.hasCustomFileName = hasCustomFileName
         self.inMemoryImage = inMemoryImage
         self.thumbnail = thumbnail
+        self.pdfPage = pdfPage
     }
 }
 
@@ -336,5 +346,23 @@ public enum AppAppearance: String, CaseIterable, Identifiable, Sendable {
         case .light: .dark
         case .dark: .system
         }
+    }
+}
+
+/// One page of an opened PDF. Pages of the same file share `documentID`.
+public struct PDFPageRef: Equatable, Sendable {
+    public let documentID: UUID
+    public let url: URL
+    public let pageIndex: Int
+    public let pageCount: Int
+    /// Page size in points as shown (rotation applied).
+    public let pageSize: CGSize
+
+    public init(documentID: UUID, url: URL, pageIndex: Int, pageCount: Int, pageSize: CGSize) {
+        self.documentID = documentID
+        self.url = url
+        self.pageIndex = pageIndex
+        self.pageCount = pageCount
+        self.pageSize = pageSize
     }
 }

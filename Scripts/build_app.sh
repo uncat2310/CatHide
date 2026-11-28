@@ -86,9 +86,9 @@ cat > "$BUILD_BUNDLE/Contents/Info.plist" << 'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.1.0</string>
+    <string>1.2.0</string>
     <key>CFBundleVersion</key>
-    <string>2</string>
+    <string>3</string>
     <key>CatHideGitHubRepo</key>
     <string>uncat2310/CatHide</string>
     <key>LSHasLocalizedDisplayName</key>
@@ -109,6 +109,7 @@ cat > "$BUILD_BUNDLE/Contents/Info.plist" << 'PLIST'
             <key>LSItemContentTypes</key>
             <array>
                 <string>public.image</string>
+                <string>com.adobe.pdf</string>
             </array>
         </dict>
     </array>

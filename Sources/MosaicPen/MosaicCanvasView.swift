@@ -46,6 +46,7 @@ final class CanvasInteractiveView: NSView {
         case crosshair
         case openHand
         case closedHand
+        case pointingHand
     }
 
     var state: MosaicDocumentState
@@ -80,6 +81,7 @@ final class CanvasInteractiveView: NSView {
     private var panOffset: CGSize = .zero
     private var trackingAreaRef: NSTrackingArea?
     private var currentCursorKind: CursorKind = .arrow
+    private var hoveredSuggestionID: Int?
 
     private static let checkerboardColor: NSColor = {
         let tileSize: CGFloat = 16
@@ -190,14 +192,15 @@ final class CanvasInteractiveView: NSView {
             )
         }
 
-        if imageChanged || revisionChanged || (!state.strokes.isEmpty && baseCompositedImage == nil) {
+        let shownStrokes = state.displayStrokes
+        if imageChanged || revisionChanged || (!shownStrokes.isEmpty && baseCompositedImage == nil) {
             cachedActiveStrokeMask = nil
-            if state.strokes.isEmpty {
+            if shownStrokes.isEmpty {
                 baseCompositedContext = nil
                 baseCompositedImage = nil
             } else if let ctx = MosaicRenderer.makeSurfaceContext(drawing: previewOriginal) {
                 MosaicRenderer.renderStrokes(
-                    state.strokes,
+                    shownStrokes,
                     onto: ctx,
                     width: previewOriginal.width,
                     height: previewOriginal.height,
@@ -250,6 +253,10 @@ final class CanvasInteractiveView: NSView {
     }
 
     private func clearHoverCursor() {
+        if hoveredSuggestionID != nil {
+            hoveredSuggestionID = nil
+            needsDisplay = true
+        }
         guard hoverPoint != nil || currentCursorKind != .arrow else { return }
         previousHoverPoint = hoverPoint
         hoverPoint = nil
@@ -487,6 +494,10 @@ final class CanvasInteractiveView: NSView {
         if isSpacePressed {
             return .openHand
         }
+        if state.suggestions != nil {
+            if let location, suggestion(at: location) != nil { return .pointingHand }
+            return .arrow
+        }
         if state.isCropping, let location {
             let imageRect = currentImageRect()
             let cropRect = cropViewRect(from: state.draftCropRect, imageRect: imageRect)
@@ -507,6 +518,7 @@ final class CanvasInteractiveView: NSView {
         case .crosshair: NSCursor.crosshair.set()
         case .openHand: NSCursor.openHand.set()
         case .closedHand: NSCursor.closedHand.set()
+        case .pointingHand: NSCursor.pointingHand.set()
         }
     }
 
@@ -599,9 +611,14 @@ final class CanvasInteractiveView: NSView {
 
         if state.isCropping {
             drawCropOverlay(in: imageRect)
+        } else if state.suggestions != nil {
+            if !state.isComparingOriginal {
+                drawSuggestionBoxes(imageRect: imageRect, displayScale: displayScale)
+            }
         } else if let selectionRectPixel = activeSelectionRectPixel {
             drawSelectionOverlay(pixelRect: selectionRectPixel, imageRect: imageRect, displayScale: displayScale)
         } else if state.tool != .rectangle,
+                  state.busyMessage == nil,
                   !state.isComparingOriginal,
                   !state.isPointerOverFloatingControls,
                   let hoverPoint,
@@ -613,6 +630,96 @@ final class CanvasInteractiveView: NSView {
         }
 
         NSGraphicsContext.restoreGraphicsState()
+    }
+
+    // MARK: - 自动识别 boxes
+
+    /// View rect of a suggestion, a little larger than the text; nil when cropped away.
+    private func suggestionViewRect(_ s: PrivacySuggestion, imageRect: CGRect, displayScale: CGFloat) -> CGRect? {
+        let p0 = originalPixelToViewPoint(CGPoint(x: s.rect.minX, y: s.rect.minY), imageRect: imageRect, displayScale: displayScale)
+        let p1 = originalPixelToViewPoint(CGPoint(x: s.rect.maxX, y: s.rect.maxY), imageRect: imageRect, displayScale: displayScale)
+        let r = CGRect(x: min(p0.x, p1.x), y: min(p0.y, p1.y), width: abs(p1.x - p0.x), height: abs(p1.y - p0.y))
+            .intersection(imageRect)
+        return r.isNull || r.width < 4 || r.height < 4 ? nil : r
+    }
+
+    private func suggestion(at point: CGPoint) -> PrivacySuggestion? {
+        guard let session = state.suggestions else { return nil }
+        let imageRect = currentImageRect()
+        let scale = effectiveDisplayScale()
+        // Smallest box first, so a box inside another can still be clicked.
+        return session.list
+            .compactMap { s in suggestionViewRect(s, imageRect: imageRect, displayScale: scale).map { (s, $0) } }
+            .filter { $0.1.contains(point) }
+            .min { $0.1.width * $0.1.height < $1.1.width * $1.1.height }?.0
+    }
+
+    private func drawSuggestionBoxes(imageRect: CGRect, displayScale: CGFloat) {
+        guard let session = state.suggestions else { return }
+        let accent = NSColor.controlAccentColor
+        var hovered: (PrivacySuggestion, CGRect, Bool)?
+        for s in session.list {
+            guard let r = suggestionViewRect(s, imageRect: imageRect, displayScale: displayScale) else { continue }
+            let on = !session.off.contains(s.id)
+            if s.id == hoveredSuggestionID { hovered = (s, r, on) }
+            let path = NSBezierPath(roundedRect: r, xRadius: 3, yRadius: 3)
+            if on {
+                // A thin outline; the effect inside is the preview.
+                NSColor.white.withAlphaComponent(0.75).setStroke()
+                path.lineWidth = 2.6
+                path.stroke()
+                accent.setStroke()
+                path.lineWidth = 1.2
+                path.stroke()
+                // Small tick inside the right end of the box, so it never covers a neighbour.
+                let d: CGFloat = min(12, r.height - 4)
+                guard d >= 7, r.width > d * 2.5 else { continue }
+                let badge = CGRect(x: r.maxX - d - (r.height - d) / 2, y: r.midY - d / 2, width: d, height: d)
+                NSColor.white.setFill()
+                NSBezierPath(ovalIn: badge.insetBy(dx: -1.2, dy: -1.2)).fill()
+                accent.setFill()
+                NSBezierPath(ovalIn: badge).fill()
+                let tick = NSBezierPath()
+                tick.move(to: CGPoint(x: badge.minX + d * 0.27, y: badge.minY + d * 0.52))
+                tick.line(to: CGPoint(x: badge.minX + d * 0.44, y: badge.minY + d * 0.33))
+                tick.line(to: CGPoint(x: badge.minX + d * 0.74, y: badge.minY + d * 0.68))
+                tick.lineWidth = max(1.3, d * 0.13)
+                tick.lineCapStyle = .round
+                tick.lineJoinStyle = .round
+                NSColor.white.setStroke()
+                tick.stroke()
+            } else {
+                // Skipped: only a dashed outline, nothing over the text.
+                path.lineWidth = 1.2
+                path.setLineDash([4, 3], count: 2, phase: 0)
+                NSColor.secondaryLabelColor.setStroke()
+                path.stroke()
+            }
+        }
+        // The kind is named only for the box under the pointer.
+        if let (s, r, on) = hovered {
+            let kind = s.kind == .code ? s.text : s.kind.title
+            let read = s.kind == .code || s.text.isEmpty ? "" : "「\(s.text.count > 18 ? String(s.text.prefix(18)) + "…" : s.text)」"
+            let label = on ? "\(kind)\(read) · 点击不打码" : "\(kind)\(read) · 点击打码"
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+                .foregroundColor: NSColor.white,
+            ]
+            let size = (label as NSString).size(withAttributes: attrs)
+            var tag = CGRect(x: r.minX, y: r.maxY + 4, width: size.width + 14, height: size.height + 6)
+            if tag.maxY > bounds.maxY - 54 { tag.origin.y = r.minY - tag.height - 4 }
+            tag.origin.x = min(tag.minX, bounds.maxX - tag.width - 6)
+            NSGraphicsContext.saveGraphicsState()
+            let shadow = NSShadow()
+            shadow.shadowColor = NSColor.black.withAlphaComponent(0.25)
+            shadow.shadowBlurRadius = 6
+            shadow.shadowOffset = NSSize(width: 0, height: -1)
+            shadow.set()
+            (on ? accent : NSColor.darkGray).setFill()
+            NSBezierPath(roundedRect: tag, xRadius: tag.height / 2, yRadius: tag.height / 2).fill()
+            NSGraphicsContext.restoreGraphicsState()
+            (label as NSString).draw(at: CGPoint(x: tag.minX + 7, y: tag.minY + 3), withAttributes: attrs)
+        }
     }
 
     private func drawSelectionOverlay(pixelRect: CGRect, imageRect: CGRect, displayScale: CGFloat) {
@@ -754,6 +861,14 @@ final class CanvasInteractiveView: NSView {
         previousHoverPoint = hoverPoint
         hoverPoint = location
         updateCursorIfNeeded(for: location)
+        if state.suggestions != nil {
+            let id = suggestion(at: location)?.id
+            if id != hoveredSuggestionID {
+                hoveredSuggestionID = id
+                needsDisplay = true
+            }
+            return
+        }
         let scale = effectiveDisplayScale()
         let dirty = brushCursorDirtyRect(at: previousHoverPoint, displayScale: scale)
             .union(brushCursorDirtyRect(at: hoverPoint, displayScale: scale))
@@ -791,6 +906,15 @@ final class CanvasInteractiveView: NSView {
         guard let original = state.originalImage else { return }
         let rect = currentImageRect()
         let displayScale = effectiveDisplayScale()
+
+        // While suggestions are shown a click switches a box; nothing is painted.
+        if let session = state.suggestions {
+            if let hit = suggestion(at: location) {
+                state.toggleSuggestions([hit.id], on: session.off.contains(hit.id))
+            }
+            return
+        }
+        if state.busyMessage != nil { return }
 
         if state.isCropping {
             let cropBox = cropViewRect(from: state.draftCropRect, imageRect: rect)
@@ -1156,6 +1280,20 @@ final class CanvasInteractiveView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
+        if state.busyMessage != nil, event.keyCode == 53 { // Escape stops recognising pages
+            state.cancelBusyWork()
+            return
+        }
+        if state.suggestions != nil {
+            if event.keyCode == 36 || event.keyCode == 76 {
+                Task { await state.applySuggestions() }
+                return
+            }
+            if event.keyCode == 53 {
+                state.cancelSuggestions()
+                return
+            }
+        }
         if state.isCropping {
             if event.keyCode == 36 || event.keyCode == 76 { // Return / Enter
                 state.applyCrop()

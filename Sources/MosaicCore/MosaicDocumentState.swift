@@ -36,7 +36,7 @@ public final class MosaicDocumentState {
     public var tool: MosaicTool = .mosaic
     public var brushSize: CGFloat = 36
     public var granularity: MosaicGranularity = .medium
-    public var effectStyle: MosaicEffectStyle = .mosaic
+    public var effectStyle: MosaicEffectStyle = .blur
     public var cropRect: NormalizedCropRect = .full
     public var rotationQuarterTurns: Int = 0
     public var isCropping: Bool = false
@@ -55,6 +55,31 @@ public final class MosaicDocumentState {
 
     public var toastMessage: String?
     public var errorMessage: String?
+
+    /// 自动识别 results waiting for the user to confirm (boxes over the current page).
+    public var suggestions: SuggestionSession?
+    /// Long work in progress (recognising text, exporting a PDF); shown instead of the toast.
+    public var busyMessage: String?
+    /// Asks for a PDF's password: (file name, the previous try was wrong) → password, nil cancels.
+    @ObservationIgnored
+    public var pdfPasswordProvider: ((String, Bool) -> String?)?
+    @ObservationIgnored
+    private var cancelBusyRequested = false
+
+    public struct SuggestionSession: Equatable, Sendable {
+        public let itemID: UUID
+        public var list: [PrivacySuggestion]
+        /// Suggestions the user switched off (everything starts selected).
+        public var off: Set<Int>
+        /// For a PDF: also find and mask the other pages.
+        public var wholeDocument: Bool
+
+        public var pickedCount: Int { list.count - list.filter { off.contains($0.id) }.count }
+        public var kinds: [PrivacyKind] {
+            PrivacyKind.displayOrder.filter { k in list.contains { $0.kind == k } }
+        }
+        public func ids(of kind: PrivacyKind) -> [Int] { list.filter { $0.kind == kind }.map(\.id) }
+    }
 
     private struct PreparedImageEntry: Sendable {
         let original: CGImage
@@ -97,6 +122,49 @@ public final class MosaicDocumentState {
         queue.count > 1
     }
 
+    public var currentItem: MosaicQueueItem? {
+        queue.indices.contains(currentIndex) ? queue[currentIndex] : nil
+    }
+
+    public var currentPDFPage: PDFPageRef? {
+        currentItem?.pdfPage
+    }
+
+    /// Indices of the pages that belong to the same PDF as the current page.
+    public var currentDocumentIndices: [Int] {
+        guard let doc = currentPDFPage?.documentID else { return [] }
+        return queue.indices.filter { queue[$0].pdfPage?.documentID == doc }
+    }
+
+    /// "3 / 12" for the pager (1-based position among this PDF's pages).
+    public var pageNumber: (current: Int, total: Int)? {
+        let pages = currentDocumentIndices
+        guard let pos = pages.firstIndex(of: currentIndex) else { return nil }
+        return (pos + 1, pages.count)
+    }
+
+    public var canSelectPreviousPage: Bool {
+        guard let first = currentDocumentIndices.first else { return false }
+        return currentIndex > first
+    }
+
+    public var canSelectNextPage: Bool {
+        guard let last = currentDocumentIndices.last else { return false }
+        return currentIndex < last
+    }
+
+    public func selectPreviousPage() {
+        if currentPDFPage == nil { selectPrevious(); return }
+        guard canSelectPreviousPage else { return }
+        selectItem(at: currentIndex - 1)
+    }
+
+    public func selectNextPage() {
+        if currentPDFPage == nil { selectNext(); return }
+        guard canSelectNextPage else { return }
+        selectItem(at: currentIndex + 1)
+    }
+
     public var canSelectPrevious: Bool {
         isMultiImageMode && currentIndex > 0
     }
@@ -123,11 +191,23 @@ public final class MosaicDocumentState {
     }
 
     public var canUndo: Bool {
-        !strokes.isEmpty
+        !strokes.isEmpty && suggestions == nil
+    }
+
+    /// Committed strokes plus the selected suggestions (a preview until 应用).
+    public var displayStrokes: [MosaicStroke] {
+        guard let session = suggestions, let originalImage,
+              queue.indices.contains(currentIndex), queue[currentIndex].id == session.itemID else {
+            return strokes
+        }
+        let preview = session.list.filter { !session.off.contains($0.id) }.map {
+            $0.stroke(imageWidth: originalImage.width, imageHeight: originalImage.height, style: effectStyle, granularity: granularity, group: -1)
+        }
+        return strokes + preview
     }
 
     public var canRedo: Bool {
-        !redoStack.isEmpty
+        !redoStack.isEmpty && suggestions == nil
     }
 
     public var imageDimensionsText: String {
@@ -166,9 +246,11 @@ public final class MosaicDocumentState {
         }
 
         fileName = finalName
-        if queue.indices.contains(currentIndex) {
-            queue[currentIndex].fileName = finalName
-            queue[currentIndex].hasCustomFileName = true
+        // A PDF is renamed as a whole.
+        let targets = currentPDFPage == nil ? [currentIndex] : currentDocumentIndices
+        for idx in targets where queue.indices.contains(idx) {
+            queue[idx].fileName = finalName
+            queue[idx].hasCustomFileName = true
         }
         return true
     }
@@ -179,39 +261,47 @@ public final class MosaicDocumentState {
         return max(4, brushSize * (maxDim / 1000.0))
     }
 
-    public func loadImages(from urls: [URL]) {
-        let imageURLs = MosaicRenderer.collectImageURLs(from: urls)
-        guard !imageURLs.isEmpty else {
-            errorMessage = "所选内容中没有找到常见图片文件。"
-            return
+    /// Images become one item each; a PDF one item per page (after asking for its password).
+    private func makeQueueItems(from urls: [URL]) -> [MosaicQueueItem]? {
+        let fileURLs = MosaicRenderer.collectImageURLs(from: urls)
+        guard !fileURLs.isEmpty else {
+            errorMessage = "所选内容中没有找到图片或 PDF 文件。"
+            return nil
         }
+        var items: [MosaicQueueItem] = []
+        var problems: [String] = []
+        for url in fileURLs {
+            if PDFSupport.isPDF(url) {
+                do {
+                    let ask = pdfPasswordProvider ?? { _, _ in nil }
+                    if let pages = try PDFSupport.openPages(url: url, granularity: granularity, effectStyle: effectStyle, askPassword: ask) {
+                        items += pages
+                    }
+                } catch {
+                    problems.append(error.localizedDescription)
+                }
+            } else {
+                items.append(MosaicQueueItem(
+                    sourceURL: url,
+                    fileName: url.lastPathComponent,
+                    granularity: granularity,
+                    effectStyle: effectStyle
+                ))
+            }
+        }
+        if !problems.isEmpty {
+            errorMessage = problems.joined(separator: "\n")
+        }
+        return items.isEmpty ? nil : items
+    }
 
-        let items = imageURLs.map { url in
-            MosaicQueueItem(
-                sourceURL: url,
-                fileName: url.lastPathComponent,
-                granularity: granularity,
-                effectStyle: effectStyle
-            )
-        }
+    public func loadImages(from urls: [URL]) {
+        guard let items = makeQueueItems(from: urls) else { return }
         loadQueue(items)
     }
 
     public func appendImages(from urls: [URL]) {
-        let imageURLs = MosaicRenderer.collectImageURLs(from: urls)
-        guard !imageURLs.isEmpty else {
-            errorMessage = "所选内容中没有找到常见图片文件。"
-            return
-        }
-
-        let items = imageURLs.map { url in
-            MosaicQueueItem(
-                sourceURL: url,
-                fileName: url.lastPathComponent,
-                granularity: granularity,
-                effectStyle: effectStyle
-            )
-        }
+        guard let items = makeQueueItems(from: urls) else { return }
         appendQueueItems(items)
     }
 
@@ -224,11 +314,12 @@ public final class MosaicDocumentState {
         syncCurrentQueueItem(resetExportedIfChanged: false)
         let firstInsertedIndex = queue.count
         queue.append(contentsOf: items)
+        SensitiveDetector.warmUp()
         currentIndex = firstInsertedIndex
         activateItem(at: firstInsertedIndex)
         startThumbnailGeneration()
         startImagePreloading(around: firstInsertedIndex)
-        showToast("已追加 \(items.count) 张图片")
+        showToast(items.allSatisfy({ $0.pdfPage != nil }) ? "已追加 \(items.count) 页" : "已追加 \(items.count) 项")
     }
 
     public func loadQueue(_ items: [MosaicQueueItem]) {
@@ -238,13 +329,24 @@ public final class MosaicDocumentState {
         clearPreparedImageCache()
         isCropping = false
         cropBackup = nil
+        suggestions = nil
+        PDFDocumentStore.shared.retain(only: Set(items.compactMap { $0.pdfPage?.documentID }))
         queue = items
         currentIndex = 0
         activateItem(at: 0)
+        SensitiveDetector.warmUp()
         startThumbnailGeneration()
         startImagePreloading(around: 0)
         if items.count > 1 {
-            showToast("已导入 \(items.count) 张图片")
+            let docs = Set(items.compactMap { $0.pdfPage?.documentID })
+            let images = items.filter { $0.pdfPage == nil }.count
+            if docs.count == 1 && images == 0 {
+                showToast("已打开 PDF，共 \(items.count) 页")
+            } else if docs.isEmpty {
+                showToast("已导入 \(items.count) 张图片")
+            } else {
+                showToast("已导入 \(images) 张图片、\(docs.count) 个 PDF")
+            }
         }
     }
 
@@ -254,6 +356,8 @@ public final class MosaicDocumentState {
         clearPreparedImageCache()
         isCropping = false
         cropBackup = nil
+        suggestions = nil
+        PDFDocumentStore.shared.retain(only: [])
         let thumb = MosaicRenderer.makeThumbnail(from: cgImage)
         let item = MosaicQueueItem(
             sourceURL: sourceURL,
@@ -265,6 +369,7 @@ public final class MosaicDocumentState {
         )
         queue = [item]
         currentIndex = 0
+        SensitiveDetector.warmUp()
         let spec = MosaicEffectSpec(style: item.effectStyle, granularity: item.granularity)
         let entry = Self.makePreparedEntry(
             from: cgImage,
@@ -276,16 +381,19 @@ public final class MosaicDocumentState {
     }
 
     private func startThumbnailGeneration() {
-        let itemsSnapshot = queue.enumerated().compactMap { index, item -> (Int, UUID, URL?, CGImage?)? in
+        let itemsSnapshot = queue.enumerated().compactMap { index, item -> (Int, UUID, URL?, CGImage?, PDFPageRef?)? in
             if item.thumbnail != nil { return nil }
-            return (index, item.id, item.sourceURL, item.inMemoryImage)
+            return (index, item.id, item.sourceURL, item.inMemoryImage, item.pdfPage)
         }
         guard !itemsSnapshot.isEmpty else { return }
 
         thumbnailTask = Task { @MainActor [weak self] in
-            for (index, itemID, url, memImage) in itemsSnapshot {
+            for (index, itemID, url, memImage, pdfPage) in itemsSnapshot {
                 if Task.isCancelled { return }
                 let thumb: CGImage? = await Task.detached(priority: .utility) {
+                    if let pdfPage {
+                        return PDFDocumentStore.shared.thumbnail(documentID: pdfPage.documentID, index: pdfPage.pageIndex)
+                    }
                     if let memImage {
                         return MosaicRenderer.makeThumbnail(from: memImage)
                     }
@@ -308,6 +416,7 @@ public final class MosaicDocumentState {
 
     public func selectItem(at index: Int) {
         guard queue.indices.contains(index), index != currentIndex else { return }
+        suggestions = nil
         syncCurrentQueueItem(resetExportedIfChanged: false)
         currentIndex = index
         activateItem(at: index)
@@ -332,6 +441,7 @@ public final class MosaicDocumentState {
         }
 
         let removed = queue[index]
+        if suggestions?.itemID == removed.id { suggestions = nil }
         preparedImageCache.removeValue(forKey: removed.id)
         preparedImageOrder.removeAll { $0 == removed.id }
 
@@ -354,6 +464,7 @@ public final class MosaicDocumentState {
             activateItem(at: currentIndex)
             startImagePreloading(around: currentIndex)
         }
+        PDFDocumentStore.shared.retain(only: Set(queue.compactMap { $0.pdfPage?.documentID }))
         showToast("已从列表移除")
     }
 
@@ -404,14 +515,7 @@ public final class MosaicDocumentState {
                 cachePreparedEntry(cached, for: item.id)
                 entry = cached
             } else {
-                let rawImage: CGImage
-                if let inMemory = item.inMemoryImage {
-                    rawImage = inMemory
-                } else if let url = item.sourceURL {
-                    rawImage = try MosaicRenderer.loadOrientedImage(from: url)
-                } else {
-                    throw MosaicRenderError.invalidImageFile
-                }
+                let rawImage = try Self.loadSourceImage(for: item)
                 let cgImage = MosaicRenderer.rotateImage(rawImage, quarterTurns: item.rotationQuarterTurns)
                 let built = Self.makePreparedEntry(
                     from: cgImage,
@@ -425,6 +529,29 @@ public final class MosaicDocumentState {
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    /// The item's pixels before rotation: the decoded image, or the PDF page rendered now.
+    nonisolated private static func loadSourceImage(for item: MosaicQueueItem) throws -> CGImage {
+        if let page = item.pdfPage {
+            guard let rendered = PDFDocumentStore.shared.renderPage(documentID: page.documentID, index: page.pageIndex) else {
+                throw MosaicRenderError.invalidImageFile
+            }
+            return rendered
+        }
+        if let inMemory = item.inMemoryImage {
+            return inMemory
+        }
+        if let url = item.sourceURL {
+            return try MosaicRenderer.loadOrientedImage(from: url)
+        }
+        throw MosaicRenderError.invalidImageFile
+    }
+
+    /// PDF pages are kept rendered only next to the shown page; images keep the larger cache.
+    private func isKeptRendered(_ index: Int) -> Bool {
+        guard queue.indices.contains(index) else { return false }
+        return queue[index].pdfPage == nil || abs(index - currentIndex) <= 1
     }
 
     nonisolated private static func makePreparedEntry(
@@ -489,26 +616,20 @@ public final class MosaicDocumentState {
         }
 
         let candidates = candidateIndices
+            .filter { isKeptRendered($0) }
             .map { queue[$0] }
             .filter { preparedImageCache[$0.id] == nil }
             .prefix(max(0, maxCachedPreparedImages - 1))
-            .map { ($0.id, $0.sourceURL, $0.inMemoryImage, Self.requiredSpecs(for: $0), $0.rotationQuarterTurns) }
+            .map { ($0, Self.requiredSpecs(for: $0), $0.rotationQuarterTurns) }
 
         guard !candidates.isEmpty else { return }
 
         preloadTask = Task { @MainActor [weak self] in
-            for (itemID, url, memImage, specs, turns) in candidates {
+            for (item, specs, turns) in candidates {
                 if Task.isCancelled { return }
+                let itemID = item.id
                 let entry: PreparedImageEntry? = await Task.detached(priority: .utility) {
-                    let rawImage: CGImage?
-                    if let memImage {
-                        rawImage = memImage
-                    } else if let url {
-                        rawImage = try? MosaicRenderer.loadOrientedImage(from: url)
-                    } else {
-                        rawImage = nil
-                    }
-                    guard let rawImage else { return nil }
+                    guard let rawImage = try? Self.loadSourceImage(for: item) else { return nil }
                     let oriented = MosaicRenderer.rotateImage(rawImage, quarterTurns: turns)
                     return Self.makePreparedEntry(
                         from: oriented,
@@ -519,7 +640,8 @@ public final class MosaicDocumentState {
 
                 if Task.isCancelled { return }
                 guard let self,
-                      self.queue.contains(where: { $0.id == itemID }),
+                      let idx = self.queue.firstIndex(where: { $0.id == itemID }),
+                      self.isKeptRendered(idx),
                       self.preparedImageCache[itemID] == nil,
                       let entry else { continue }
                 self.cachePreparedEntry(entry, for: itemID)
@@ -535,6 +657,14 @@ public final class MosaicDocumentState {
         preparedImageOrder.append(id)
 
         let activeID = queue.indices.contains(currentIndex) ? queue[currentIndex].id : nil
+        // Free PDF pages that are no longer next to the shown one.
+        let far = Set(queue.indices.filter { !isKeptRendered($0) }.map { queue[$0].id })
+        if !far.isEmpty {
+            preparedImageOrder.removeAll { far.contains($0) && $0 != activeID }
+            for key in preparedImageCache.keys where far.contains(key) && key != activeID {
+                preparedImageCache.removeValue(forKey: key)
+            }
+        }
         while preparedImageOrder.count > maxCachedPreparedImages {
             if let evictIndex = preparedImageOrder.firstIndex(where: { $0 != activeID }) {
                 let evictedID = preparedImageOrder.remove(at: evictIndex)
@@ -637,22 +767,33 @@ public final class MosaicDocumentState {
         syncCurrentQueueItem()
     }
 
+    /// One step back; strokes added together (one 自动识别 apply) go back together.
     public func undo() {
-        guard let last = strokes.popLast() else { return }
+        guard suggestions == nil, let last = strokes.popLast() else { return }
         redoStack.append(last)
+        if let group = last.group {
+            while let prev = strokes.last, prev.group == group {
+                redoStack.append(strokes.removeLast())
+            }
+        }
         maskRevision += 1
         syncCurrentQueueItem()
     }
 
     public func redo() {
-        guard let next = redoStack.popLast() else { return }
+        guard suggestions == nil, let next = redoStack.popLast() else { return }
         strokes.append(next)
+        if let group = next.group {
+            while let following = redoStack.last, following.group == group {
+                strokes.append(redoStack.removeLast())
+            }
+        }
         maskRevision += 1
         syncCurrentQueueItem()
     }
 
     public func clearAll() {
-        guard !strokes.isEmpty else { return }
+        guard !strokes.isEmpty, suggestions == nil else { return }
         strokes.removeAll()
         redoStack.removeAll()
         maskRevision += 1
@@ -667,6 +808,10 @@ public final class MosaicDocumentState {
         preloadTask?.cancel()
         preloadTask = nil
         clearPreparedImageCache()
+        PDFDocumentStore.shared.retain(only: [])
+        suggestions = nil
+        cancelBusyRequested = true
+        busyMessage = nil
         originalImage = nil
         previewOriginalImage = nil
         previewMosaicImage = nil
@@ -699,6 +844,7 @@ public final class MosaicDocumentState {
         granularity = newGranularity
         syncCurrentQueueItem(resetExportedIfChanged: false)
         previewMosaicImage = previewEffectImage(for: currentEffectSpec)
+        if suggestions != nil { maskRevision += 1 }
     }
 
     public func setEffectStyle(_ newStyle: MosaicEffectStyle) {
@@ -706,6 +852,7 @@ public final class MosaicDocumentState {
         effectStyle = newStyle
         syncCurrentQueueItem(resetExportedIfChanged: false)
         previewMosaicImage = previewEffectImage(for: currentEffectSpec)
+        if suggestions != nil { maskRevision += 1 }
     }
 
     @discardableResult
@@ -738,8 +885,13 @@ public final class MosaicDocumentState {
         return generated
     }
 
+    /// PDF pages keep their page size, so they are not cropped or rotated.
+    public var canCrop: Bool {
+        hasImage && currentPDFPage == nil && suggestions == nil && busyMessage == nil
+    }
+
     public func beginCrop() {
-        guard hasImage, !isCropping else { return }
+        guard canCrop, !isCropping else { return }
         cropBackup = CropBackup(
             cropRect: cropRect,
             rotationQuarterTurns: rotationQuarterTurns,
@@ -793,7 +945,8 @@ public final class MosaicDocumentState {
                 points: rotatedPoints,
                 rect: rotatedRect,
                 effectStyle: stroke.effectStyle,
-                granularity: stroke.granularity
+                granularity: stroke.granularity,
+                group: stroke.group
             )
         }
 
@@ -937,16 +1090,20 @@ public final class MosaicDocumentState {
     }
 
     public func exportImage(to url: URL) throws {
+        let ext = url.pathExtension.lowercased()
+        if ext == "pdf", let page = currentPDFPage {
+            try exportPDF(documentID: page.documentID, to: url)
+            return
+        }
         guard let rendered = renderFinalImage() else {
             throw MosaicRenderError.failedToEncodeImage
         }
-        let ext = url.pathExtension.lowercased()
         let format: ExportFormat = (ext == "jpg" || ext == "jpeg") ? .jpeg : .png
         guard let data = MosaicRenderer.encodeImage(
             rendered,
             format: format,
-            stripMetadata: stripExifOnExport,
-            sourceMetadataURL: sourceURL
+            stripMetadata: stripExifOnExport || currentPDFPage != nil,
+            sourceMetadataURL: currentPDFPage == nil ? sourceURL : nil
         ) else {
             throw MosaicRenderError.failedToEncodeImage
         }
@@ -955,17 +1112,70 @@ public final class MosaicDocumentState {
         if queue.indices.contains(currentIndex) {
             queue[currentIndex].isExported = true
         }
+        finishExport(done: currentPDFPage == nil ? "已导出图片" : "已导出当前页")
+    }
 
-        if isMultiImageMode {
-            if let nextIndex = nextUnexportedIndex(after: currentIndex) {
-                selectItem(at: nextIndex)
-                showToast("已导出，已切换至下一张 (\(nextIndex + 1)/\(queue.count))")
-            } else {
-                showToast("已导出（本批图片已全部完成）")
-            }
-        } else {
-            showToast("已导出图片")
+    /// After an export: move on to the next item that still needs exporting.
+    private func finishExport(done: String) {
+        guard isMultiImageMode else {
+            showToast(done)
+            return
         }
+        let doc = currentPDFPage?.documentID
+        let next = nextUnexportedIndex(after: currentIndex).flatMap { idx -> Int? in
+            // Pages of a PDF just exported as a whole are done too.
+            if let doc, queue[idx].pdfPage?.documentID == doc { return nil }
+            return idx
+        }
+        if let next {
+            selectItem(at: next)
+            showToast("\(done)，已切换至下一项 (\(next + 1)/\(queue.count))")
+        } else {
+            showToast("\(done)（本批已全部完成）")
+        }
+    }
+
+    /// The pages of one PDF in order, rasterised with their strokes, at their original size.
+    private func renderedPDFPages(documentID: UUID) throws -> [(image: CGImage, size: CGSize)] {
+        try queue.indices.filter { queue[$0].pdfPage?.documentID == documentID }.map { idx in
+            let item = queue[idx]
+            guard let page = item.pdfPage else { throw MosaicRenderError.failedToEncodeImage }
+            let source: CGImage
+            if idx == currentIndex, let originalImage {
+                source = originalImage
+            } else {
+                source = try Self.loadSourceImage(for: item)
+            }
+            guard let rendered = MosaicRenderer.renderFinalImage(
+                original: source,
+                strokes: item.strokes,
+                granularity: item.granularity,
+                style: item.effectStyle
+            ) else { throw MosaicRenderError.failedToEncodeImage }
+            return (rendered, page.pageSize)
+        }
+    }
+
+    /// Writes the whole PDF as pictures only, so masked text is gone from the file.
+    public func exportPDF(documentID: UUID, to url: URL) throws {
+        syncCurrentQueueItem(resetExportedIfChanged: false)
+        let pages = try renderedPDFPages(documentID: documentID)
+        guard !pages.isEmpty else { throw MosaicRenderError.failedToEncodeImage }
+        try PDFSupport.writeImagePDF(pages: pages, to: url)
+        for idx in queue.indices where queue[idx].pdfPage?.documentID == documentID {
+            queue[idx].isExported = true
+        }
+        finishExport(done: "已导出 PDF（\(pages.count) 页）")
+    }
+
+    /// How many files a batch export writes: one per edited image, one per PDF with an edited page.
+    public var batchExportCount: Int {
+        var docs = Set<UUID>()
+        var images = 0
+        for item in queue where item.hasEdits {
+            if let doc = item.pdfPage?.documentID { docs.insert(doc) } else { images += 1 }
+        }
+        return images + docs.count
     }
 
     @discardableResult
@@ -980,19 +1190,40 @@ public final class MosaicDocumentState {
         let fm = FileManager.default
         var usedFileNames = Set<String>()
         var exportedCount = 0
+        var exportedDocs = Set<UUID>()
+
+        func outputURL(for item: MosaicQueueItem, ext: String) -> URL {
+            let stem = ((item.fileName as NSString).deletingPathExtension).trimmingCharacters(in: .whitespacesAndNewlines)
+            let cleanStem = stem.isEmpty ? "cathide" : stem
+            let outputBase = item.hasCustomFileName ? cleanStem : "\(cleanStem)_cathide"
+            return uniqueOutputURL(
+                in: directoryURL,
+                baseName: outputBase,
+                fileExtension: ext,
+                usedNames: &usedFileNames,
+                fileManager: fm
+            )
+        }
 
         for idx in editedIndices {
             let item = queue[idx]
+            // An edited PDF is written whole, as one PDF.
+            if let page = item.pdfPage {
+                guard exportedDocs.insert(page.documentID).inserted else { continue }
+                let pages = try renderedPDFPages(documentID: page.documentID)
+                try PDFSupport.writeImagePDF(pages: pages, to: outputURL(for: item, ext: "pdf"))
+                for j in queue.indices where queue[j].pdfPage?.documentID == page.documentID {
+                    queue[j].isExported = true
+                }
+                exportedCount += 1
+                continue
+            }
+
             let sourceCG: CGImage
             if idx == currentIndex, let originalImage {
                 sourceCG = originalImage
-            } else if let inMemory = item.inMemoryImage {
-                sourceCG = MosaicRenderer.rotateImage(inMemory, quarterTurns: item.rotationQuarterTurns)
-            } else if let sourceURL = item.sourceURL {
-                let raw = try MosaicRenderer.loadOrientedImage(from: sourceURL)
-                sourceCG = MosaicRenderer.rotateImage(raw, quarterTurns: item.rotationQuarterTurns)
             } else {
-                continue
+                sourceCG = MosaicRenderer.rotateImage(try Self.loadSourceImage(for: item), quarterTurns: item.rotationQuarterTurns)
             }
 
             guard let rendered = MosaicRenderer.renderFinalImage(
@@ -1010,22 +1241,12 @@ public final class MosaicDocumentState {
                 throw MosaicRenderError.failedToEncodeImage
             }
 
-            let stem = ((item.fileName as NSString).deletingPathExtension).trimmingCharacters(in: .whitespacesAndNewlines)
-            let cleanStem = stem.isEmpty ? "cathide" : stem
-            let outputBase = item.hasCustomFileName ? cleanStem : "\(cleanStem)_cathide"
-            let targetURL = uniqueOutputURL(
-                in: directoryURL,
-                baseName: outputBase,
-                fileExtension: format.fileExtension,
-                usedNames: &usedFileNames,
-                fileManager: fm
-            )
-            try encoded.write(to: targetURL, options: .atomic)
+            try encoded.write(to: outputURL(for: item, ext: format.fileExtension), options: .atomic)
             queue[idx].isExported = true
             exportedCount += 1
         }
 
-        showToast("已批量导出 \(exportedCount) 张图片")
+        showToast(exportedDocs.isEmpty ? "已批量导出 \(exportedCount) 张图片" : "已批量导出 \(exportedCount) 个文件")
         return exportedCount
     }
 
@@ -1051,13 +1272,144 @@ public final class MosaicDocumentState {
     }
 
     public func suggestedExportFileName(format: ExportFormat = .png) -> String {
+        suggestedExportFileName(fileExtension: format.fileExtension, wholePDF: false)
+    }
+
+    /// `wholePDF`: the name for the PDF itself; otherwise a single page gets "_p3" added.
+    public func suggestedExportFileName(fileExtension: String, wholePDF: Bool) -> String {
         let isCustom = queue.indices.contains(currentIndex) && queue[currentIndex].hasCustomFileName
         let rawBase = isCustom ? fileName : (sourceURL?.lastPathComponent ?? fileName)
         let stem = (rawBase as NSString).deletingPathExtension.trimmingCharacters(in: .whitespacesAndNewlines)
-        let cleanBase = stem.isEmpty ? "cathide" : stem
+        var cleanBase = stem.isEmpty ? "cathide" : stem
+        if !wholePDF, let page = pageNumber, page.total > 1 {
+            cleanBase += "_p\(page.current)"
+        }
         return isCustom
-            ? "\(cleanBase).\(format.fileExtension)"
-            : "\(cleanBase)_cathide.\(format.fileExtension)"
+            ? "\(cleanBase).\(fileExtension)"
+            : "\(cleanBase)_cathide.\(fileExtension)"
+    }
+
+    // MARK: - 自动识别
+
+    public var canAutoDetect: Bool {
+        hasImage && !isCropping && busyMessage == nil
+    }
+
+    /// Stops a long run (recognising the other pages of a PDF).
+    public func cancelBusyWork() {
+        cancelBusyRequested = true
+    }
+
+    /// Reads the current image and shows what looks sensitive as boxes to confirm.
+    public func startAutoDetect() async {
+        guard canAutoDetect, suggestions == nil, let image = originalImage,
+              queue.indices.contains(currentIndex) else { return }
+        let itemID = queue[currentIndex].id
+        isComparingOriginal = false
+        busyMessage = "正在识别敏感信息…"
+        defer { busyMessage = nil }
+        do {
+            let found = try await Task.detached(priority: .userInitiated) {
+                try SensitiveDetector.detect(in: image)
+            }.value
+            guard queue.indices.contains(currentIndex), queue[currentIndex].id == itemID else { return }
+            // Only what is inside the crop.
+            let visible = cropRect.isFull
+                ? CGRect(x: 0, y: 0, width: image.width, height: image.height)
+                : cropRect.pixelRect(width: image.width, height: image.height)
+            let list = found.filter { $0.rect.intersects(visible) }
+            if list.isEmpty {
+                showToast("没有找到手机号、地址、证件号等敏感信息")
+            } else {
+                suggestions = SuggestionSession(itemID: itemID, list: list, off: [], wholeDocument: true)
+                maskRevision += 1
+            }
+        } catch {
+            showToast("识别失败：\(error.localizedDescription)")
+        }
+    }
+
+    public func toggleSuggestions(_ ids: [Int], on: Bool) {
+        guard var session = suggestions else { return }
+        for id in ids {
+            if on { session.off.remove(id) } else { session.off.insert(id) }
+        }
+        suggestions = session
+        maskRevision += 1
+    }
+
+    public func setSuggestionsWholeDocument(_ on: Bool) {
+        suggestions?.wholeDocument = on
+    }
+
+    public func cancelSuggestions() {
+        guard suggestions != nil else { return }
+        suggestions = nil
+        maskRevision += 1
+    }
+
+    /// Masks the selected boxes in one undo step. For a PDF with 全部页面 on, the other pages are
+    /// recognised too and masked the same way (kinds switched off here are skipped there).
+    public func applySuggestions() async {
+        guard let session = suggestions, let image = originalImage,
+              queue.indices.contains(currentIndex), queue[currentIndex].id == session.itemID else { return }
+        let group = Int(Date().timeIntervalSince1970 * 1000) & 0x7FFF_FFFF
+        let style = effectStyle
+        let gran = granularity
+        let add = session.list.filter { !session.off.contains($0.id) }.map {
+            $0.stroke(imageWidth: image.width, imageHeight: image.height, style: style, granularity: gran, group: group)
+        }
+        suggestions = nil
+        if !add.isEmpty {
+            strokes.append(contentsOf: add)
+            redoStack.removeAll()
+            syncCurrentQueueItem()
+        }
+        maskRevision += 1
+
+        let others = session.wholeDocument
+            ? currentDocumentIndices.filter { $0 != currentIndex }.map { queue[$0] }
+            : []
+        guard !others.isEmpty else {
+            if !add.isEmpty { showToast("已打码 \(add.count) 处，撤销一次即可全部还原") }
+            return
+        }
+
+        let skipped = Set(session.kinds.filter { k in session.list.allSatisfy { $0.kind != k || session.off.contains($0.id) } })
+        cancelBusyRequested = false
+        var pagesWithMasks = add.isEmpty ? 0 : 1
+        var total = add.count
+        var done = 0
+        for item in others {
+            if cancelBusyRequested { break }
+            done += 1
+            busyMessage = "正在识别其余页面 \(done)/\(others.count)…（Esc 停止）"
+            let found: [PrivacySuggestion]
+            let size: (Int, Int)
+            do {
+                (found, size) = try await Task.detached(priority: .userInitiated) {
+                    let page = try Self.loadSourceImage(for: item)
+                    return (try SensitiveDetector.detect(in: page), (page.width, page.height))
+                }.value
+            } catch {
+                showToast("识别失败：\(error.localizedDescription)")
+                break
+            }
+            guard let idx = queue.firstIndex(where: { $0.id == item.id }) else { continue }
+            let pageStrokes = found.filter { !skipped.contains($0.kind) }.map {
+                $0.stroke(imageWidth: size.0, imageHeight: size.1, style: style, granularity: gran, group: group)
+            }
+            guard !pageStrokes.isEmpty else { continue }
+            queue[idx].strokes += pageStrokes
+            queue[idx].redoStack.removeAll()
+            queue[idx].isExported = false
+            pagesWithMasks += 1
+            total += pageStrokes.count
+        }
+        busyMessage = nil
+        let stopped = cancelBusyRequested ? "已停止（识别了 \(done)/\(others.count) 页），" : ""
+        cancelBusyRequested = false
+        showToast(total > 0 ? "\(stopped)在 \(pagesWithMasks) 页中打码 \(total) 处，可以逐页检查" : "\(stopped)其余页面没有找到敏感信息")
     }
 
     public func showToast(_ message: String) {
